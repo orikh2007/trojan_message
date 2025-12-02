@@ -9,7 +9,7 @@
 
 #include <nlohmann/json.hpp>
 #include <string>
-
-const std::string DDNS_URL = "trojantext.ddnsgeek.com";
-const std::string DDNS_ID = "13292760";
-const std::string DDNS_API_KEY = "6WU4aYgcb6TYXc6ebYgVb54Y3cT45Xca";
+using namespace std;
+const string DDNS_URL = "trojantext.ddnsgeek.com";
+const string DDNS_ID = "13292760";
+const string DDNS_API_KEY = "6WU4aYgcb6TYXc6ebYgVb54Y3cT45Xca";

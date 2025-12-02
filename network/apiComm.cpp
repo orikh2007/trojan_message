@@ -62,3 +62,7 @@ void getDDNS() {
 	json resp = json::parse(response);
 	cout << resp.dump(4) << endl;
 }
+
+void setRoot(string ip, int port) {
+
+}

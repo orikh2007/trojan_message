@@ -11,6 +11,7 @@
 using namespace std;
 void getDDNS();
 string getIP();
+void setRoot(string ip, int port);
 
 class apiComm {
 };

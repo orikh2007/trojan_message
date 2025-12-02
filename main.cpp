@@ -3,6 +3,6 @@
 
 int main(int argc, char *argv[]) {
     getDDNS();
-    // getIP();
+    getIP();
     return 0;
 }
