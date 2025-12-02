@@ -7,11 +7,11 @@
 #include <curl/curl.h>
 #include <iostream>
 #include <string>
-#include "networkSettings.h"
+#include "../networkSettings.h"
 using namespace std;
-void getDDNS();
+string getDDNS();
 string getIP();
-void setRoot(string ip, int port);
+void setRoot(string ip);
 
 class apiComm {
 };

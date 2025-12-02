@@ -1,8 +1,8 @@
 #include <iostream>
-#include "network/apiComm.h"
+#include "headerFiles/networking/apiComm.h"
 
 int main(int argc, char *argv[]) {
+    setRoot(getIP());
     getDDNS();
-    getIP();
     return 0;
 }

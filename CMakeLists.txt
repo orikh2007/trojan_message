@@ -11,8 +11,9 @@ endif()
 
 add_executable(trojan_message main.cpp
         network/apiComm.cpp
-        network/apiComm.h
-        network/networkSettings.h)
+        headerFiles/networking/apiComm.h
+        headerFiles/networking/networkSettings.h
+        headerFiles/networking/Node.h)
 
 
 find_package(nlohmann_json REQUIRED)
