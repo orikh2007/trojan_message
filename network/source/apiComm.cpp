@@ -2,7 +2,7 @@
 // Created by orikh on 02/12/2025.
 //
 
-#include "../headerFiles/networking/apiComm.h"
+#include "../headers/apiComm.h"
 const std::string DDNS_API = "https://api.dynu.com/v2/";
 using json = nlohmann::json;
 using namespace std;
@@ -14,26 +14,41 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* use
 
 static size_t writeData(void* buffer, size_t size, size_t nmemb, void* userp) {return size * nmemb;}
 
-string getIP() {
-	CURL *curl;
-	string response;
-	CURLcode res;
+static bool fetchUrlToString(const char* url, std::string& out, long ipResolve /* CURL_IPRESOLVE_* */) {
+	CURL* curl = curl_easy_init();
+	if (!curl) return false;
 
-	curl = curl_easy_init();
-	if (curl) {
-		curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+	out.clear();
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+	curl_easy_setopt(curl, CURLOPT_IPRESOLVE, ipResolve);
 
-		res = curl_easy_perform(curl);
-		if (res != CURLE_OK) cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << endl; // debug
-
+	CURLcode res = curl_easy_perform(curl);
+	if (res != CURLE_OK) {
+		std::cerr << "curl failed (" << url << "): " << curl_easy_strerror(res) << "\n";
 		curl_easy_cleanup(curl);
+		return false;
 	}
 
-	curl_global_cleanup();
+	curl_easy_cleanup(curl);
+	return true;
+}
 
-	return response;
+vector<string> getIP_() {
+	string ipv4, ipv6;
+
+	fetchUrlToString("https://api64.ipify.org", ipv4, CURL_IPRESOLVE_V4);
+	fetchUrlToString("https://api64.ipify.org", ipv6, CURL_IPRESOLVE_V6);
+
+	return {ipv4, ipv6};
+}
+
+vector<string> getIP() {
+	curl_global_init(CURL_GLOBAL_DEFAULT);
+	auto ips = getIP_();
+	curl_global_cleanup();
+	return ips;
 }
 
 string getDDNS() {
@@ -67,7 +82,7 @@ string getDDNS() {
 	return resp;
 }
 
-void setRoot(string ip) {
+void setRoot(string ipv4, string ipv6) {
 	CURL *curl;
 	CURLcode res;
 	string response;
@@ -84,7 +99,7 @@ void setRoot(string ip) {
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
 
-		string json_req = "{\"name\":\"" + DDNS_URL + "\",\"ipv4Address\":\"" + ip + "\"}";
+		string json_req = "{\"name\":\"" + DDNS_URL + "\",\"ipv4Address\":\"" + ipv4 + "\",\"ipv6Address\":\"" + ipv6 + "\"}";
 
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_req.c_str());
 

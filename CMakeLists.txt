@@ -9,11 +9,20 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(trojan_message main.cpp
-        network/apiComm.cpp
-        headerFiles/networking/apiComm.h
-        headerFiles/networking/networkSettings.h
-        headerFiles/networking/Node.h)
+add_executable(trojan_message
+        network/source/apiComm.cpp
+        network/headers/apiComm.h
+        network/headers/networkSettings.h
+        network/headers/Node.h
+        main.cpp
+        main.cpp
+        network/source/CommV6.cpp
+        network/headers/CommV6.h)
+
+target_link_libraries(trojan_message
+        PRIVATE
+        ws2_32
+)
 
 
 find_package(nlohmann_json REQUIRED)
