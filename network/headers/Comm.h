@@ -9,19 +9,19 @@
 #include <iostream>
 using udp = asio::ip::udp;
 
-class CommV6 : std::enable_shared_from_this<CommV6>{
+class Comm : std::enable_shared_from_this<Comm>{
 public:
     using OnMessage = std::function<void(const asio::ip::udp::endpoint&, const std::string&)>;
 
-    CommV6(asio::io_context& io, uint16_t port)
+    Comm(asio::io_context& io, uint16_t port)
     : io_(io),
     socket_(io),
     resolver_(io)
     {
-        socket_.open(udp::v6());
+        socket_.open(udp::v4());
         socket_.set_option(asio::socket_base::reuse_address(true));
         socket_.set_option(asio::ip::v6_only(true));
-        socket_.bind(udp::endpoint(udp::v6(), port));
+        socket_.bind(udp::endpoint(udp::v4(), port));
     }
 
     void set_on_message(OnMessage cb) { on_message_ = std::move(cb); }
@@ -41,7 +41,7 @@ private:
     void start_receive() {
         socket_.async_receive_from(asio::buffer(rx_buf_), remote_, [self = shared_from_this()](std::error_code ec, std::size_t n) {
             if (!ec) {
-                std::string msg(self->rx_buf_.data(), self->rx_buf_.data() + n);
+                const std::string msg(self->rx_buf_.data(), self->rx_buf_.data() + n);
                 if (self->on_message_) {
                     self->on_message_(self->remote_, msg);
                 } else {
@@ -49,6 +49,7 @@ private:
                 }
             } else {
                 std::cerr << "recv error: " << ec.message() << std::endl;
+                self->io_.stop();
             }
             self-> start_receive();
         });

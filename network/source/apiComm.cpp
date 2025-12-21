@@ -44,11 +44,11 @@ vector<string> getIP_() {
 	return {ipv4, ipv6};
 }
 
-vector<string> getIP() {
+string getIP(int n) {
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 	auto ips = getIP_();
 	curl_global_cleanup();
-	return ips;
+	return ips[n];
 }
 
 string getDDNS() {
@@ -77,10 +77,11 @@ string getDDNS() {
 
 	curl_global_cleanup();
 	string resp = json::parse(response)["domains"][0]["ipv4Address"];
-	cout << json::parse(response).dump(4) << endl;
-	cout << resp << endl;
+	// cout << json::parse(response).dump(4) << endl;
 	return resp;
 }
+
+
 
 void setRoot(string ipv4, string ipv6) {
 	CURL *curl;

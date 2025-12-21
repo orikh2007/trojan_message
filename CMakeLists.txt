@@ -16,17 +16,24 @@ add_executable(trojan_message
         network/headers/Node.h
         main.cpp
         main.cpp
-        network/source/CommV6.cpp
-        network/headers/CommV6.h)
+        network/source/Comm.cpp
+        network/headers/Comm.h
+        network/headers/Asio.h
+        network/headers/Msg.h)
+
+target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
+
+if (WIN32)
+    target_link_libraries(trojan_message PRIVATE ws2_32)
+    # Often needed for async networking on Windows:
+    target_link_libraries(trojan_message PRIVATE mswsock)
+endif()
+
+find_package(CURL REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 
 target_link_libraries(trojan_message
         PRIVATE
-        ws2_32
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
 )
-
-
-find_package(nlohmann_json REQUIRED)
-target_link_libraries(trojan_message PRIVATE CURL::libcurl)
-
-find_package(CURL REQUIRED)
-target_link_libraries(trojan_message PRIVATE nlohmann_json::nlohmann_json)
