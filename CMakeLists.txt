@@ -10,11 +10,11 @@ else()
 endif()
 
 add_executable(trojan_message
+        main.cpp
         network/source/apiComm.cpp
         network/headers/apiComm.h
         network/headers/networkSettings.h
         network/headers/Node.h
-        main.cpp
         network/source/Comm.cpp
         network/headers/Comm.h
         network/headers/Asio.h

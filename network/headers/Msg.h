@@ -129,7 +129,7 @@ inline std::string b64_encode(const std::vector<uint8_t>& in) {
 
     size_t i = 0;
     while (i + 3 <= in.size()) {
-        uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8) | uint32_t(in[i + 2]);
+        uint32_t n = (static_cast<uint32_t>(in[i]) << 16) | (static_cast<uint32_t>(in[i + 1]) << 8) | static_cast<uint32_t>(in[i + 2]);
         out.push_back(tbl[(n >> 18) & 63]);
         out.push_back(tbl[(n >> 12) & 63]);
         out.push_back(tbl[(n >> 6) & 63]);
@@ -139,13 +139,13 @@ inline std::string b64_encode(const std::vector<uint8_t>& in) {
 
     const size_t rem = in.size() - i;
     if (rem == 1) {
-        uint32_t n = (uint32_t(in[i]) << 16);
+        uint32_t n = (static_cast<uint32_t>(in[i]) << 16);
         out.push_back(tbl[(n >> 18) & 63]);
         out.push_back(tbl[(n >> 12) & 63]);
         out.push_back('=');
         out.push_back('=');
     } else if (rem == 2) {
-        uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8);
+        uint32_t n = (static_cast<uint32_t>(in[i]) << 16) | (static_cast<uint32_t>(in[i + 1]) << 8);
         out.push_back(tbl[(n >> 18) & 63]);
         out.push_back(tbl[(n >> 12) & 63]);
         out.push_back(tbl[(n >> 6) & 63]);
@@ -155,8 +155,8 @@ inline std::string b64_encode(const std::vector<uint8_t>& in) {
     return out;
 }
 
-inline std::optional<std::vector<uint8_t>> b64_decode(std::string_view s) {
-    auto val = [](char c) -> int {
+inline std::optional<std::vector<uint8_t>> b64_decode(const std::string_view s) {
+    auto val = [](const char c) -> int {
         if ('A' <= c && c <= 'Z') return c - 'A';
         if ('a' <= c && c <= 'z') return c - 'a' + 26;
         if ('0' <= c && c <= '9') return c - '0' + 52;
@@ -338,6 +338,10 @@ inline json msg_punch_ack(const std::string& node_id, const std::string& token_h
 
 inline json msg_data_b64(const std::string& node_id, const std::string& to_id,
                          uint32_t seq, const std::vector<uint8_t>& payload_bytes) {
+    /*
+     * Meant to send data in base64 format.
+     * Use data_payload_bytes to decrypt.
+     */
     require(to_id.size() == 16 && is_hex(to_id), "to must be 16 hex chars");
 
     json body;
@@ -377,7 +381,7 @@ inline std::optional<std::vector<uint8_t>> data_payload_bytes(const Envelope& e)
     if (e.type != MsgType::DATA) return std::nullopt;
     const auto enc = e.body.value("enc", "");
     if (enc != "b64") return std::nullopt;
-    auto p = e.body.value("payload", "");
+    const auto p = e.body.value("payload", "");
     if (p.empty()) return std::nullopt;
     return b64_decode(p);
 }
