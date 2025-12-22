@@ -16,6 +16,14 @@
 #include <string_view>
 #include <vector>
 
+using Clock = std::chrono::steady_clock;
+
+struct peerInfo {
+    udp::endpoint ep;
+    Clock::time_point last_seen;
+    std::string peerId;
+};
+
 namespace proto {
 using json = nlohmann::json;
 
@@ -258,13 +266,30 @@ inline json msg_register(const std::string& node_id, uint16_t listen_port, int w
 }
 
 inline json msg_register_ack(const std::string& tx,
-                             const std::string& you_ip, uint16_t you_port,
-                             const std::vector<json>& peers,
-                             int ka_sec = 15) {
+                             const udp::endpoint you,
+                             const std::vector<peerInfo>& peers,
+                             const std::string& token_hex,
+                             int ka_sec = 15, int punch_ms = 250, int timeout_ms = 4000) {
+    require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
     json body;
+    std::string you_ip = you.address().to_string();
+    uint16_t you_port = you.port();
+    vector<json> peersJ;
+    for (auto peer : peers) {
+        json peerJ;
+        peerJ["id"] = peer.peerId;
+        peerJ["ip"] = peer.ep.address().to_string();
+        peerJ["port"] = peer.ep.port();
+        peersJ.push_back(peerJ);
+    }
+
     body["you"] = {{"ip", you_ip}, {"port", you_port}};
-    body["peers"] = peers; // each peer: {"id","ip","port"}
+    body["peers"] = peersJ; // each peer: {"id","ip","port"}
     body["ka_sec"] = ka_sec;
+    body["token"] = token_hex;
+    body["punch_ms"] = punch_ms;
+    body["timeout_ms"] = timeout_ms;
+
     return make_envelope(MsgType::REGISTER_ACK, "ROOT", tx, body);
 }
 
@@ -273,27 +298,28 @@ inline json msg_keepalive(const std::string& node_id) {
     return make_envelope(MsgType::KEEPALIVE, node_id, random_tx_id(), body);
 }
 
-inline json msg_connect_request(const std::string& node_id, const std::string& target_id) {
-    require(target_id.size() == 16 && is_hex(target_id), "target_id must be 16 hex chars");
-    json body;
-    body["target_id"] = target_id;
-    return make_envelope(MsgType::CONNECT_REQUEST, node_id, random_tx_id(), body);
-}
+// inline json msg_connect_request(const std::string& node_id, const std::string& target_id) {
+    // require(target_id.size() == 16 && is_hex(target_id), "target_id must be 16 hex chars");
+    // json body;
+    // body["target_id"] = target_id;
+    // return make_envelope(MsgType::CONNECT_REQUEST, node_id, random_tx_id(), body);
+// } //connect request - used reg_ack in instead (easier to understand)
 
 inline json msg_introduce(const std::string& tx,
-                          const std::string& peer_id, const std::string& peer_ip, uint16_t peer_port,
+                          const peerInfo& peer,
                           const std::string& token_hex,
-                          int punch_ms = 250, int timeout_ms = 4000) {
-    require(peer_id.size() == 16 && is_hex(peer_id), "peer.id must be 16 hex chars");
+                          int ka_sec = 15, int punch_ms = 250, int timeout_ms = 4000) {
+    require(peer.peerId.size() == 16 && is_hex(peer.peerId), "peer.id must be 16 hex chars");
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
 
     json body;
-    body["peer"] = {{"id", peer_id}, {"ip", peer_ip}, {"port", peer_port}};
+    body["peer"] = {{"id", peer.peerId}, {"ip", peer.ep.address().to_string()}, {"port", peer.ep.port()}};
+    body["ka_sec"] = ka_sec;
     body["token"] = token_hex;
     body["punch_ms"] = punch_ms;
     body["timeout_ms"] = timeout_ms;
 
-    return make_envelope(MsgType::INTRODUCE, "ROOT", tx, body);
+    return make_envelope(MsgType::INTRODUCE, "ROOT", random_tx_id(), body);
 }
 
 inline json msg_punch(const std::string& node_id, const std::string& token_hex) {

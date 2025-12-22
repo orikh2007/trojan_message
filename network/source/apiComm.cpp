@@ -85,11 +85,11 @@ string getDDNS() {
 
 void setRoot(const string& ip) {
 	CURL *curl;
-	CURLcode res;
 	string response;
 
 	curl = curl_easy_init();
 	if (curl) {
+		CURLcode res;
 		curl_easy_setopt(curl, CURLOPT_URL, ("https://api.dynu.com/v2/dns/"+DDNS_ID).c_str());
 
 		struct curl_slist* headers = nullptr;

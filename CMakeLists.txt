@@ -18,8 +18,8 @@ add_executable(trojan_message
         network/source/Comm.cpp
         network/headers/Comm.h
         network/headers/Asio.h
-        network/headers/Msg.h)
-
+        network/headers/msg.h
+)
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 
 if (WIN32)
