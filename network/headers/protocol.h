@@ -4,18 +4,8 @@
 
 #ifndef TROJAN_MESSAGE_PROTOCOL_H
 #define TROJAN_MESSAGE_PROTOCOL_H
-#include <thread>
-#include <iostream>
-#include <vector>
-#include <cstring>
-#include <string>
-#include <mutex>
-#ifdef _WIN32
-  #include <winsock2.h>
-#else
-  #include <arpa/inet.h>
-#endif
-using udp = asio::ip::udp;
+#include "networkSettings.h"
+
 #pragma pack(push, 1)
 struct Header {
     uint32_t magic = 0x626f6f62; //check the hex meaning

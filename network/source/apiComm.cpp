@@ -3,12 +3,9 @@
 //
 
 #include "../headers/apiComm.h"
-const std::string DDNS_API = "https://api.dynu.com/v2/";
-using json = nlohmann::json;
-using namespace std;
 static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* userp)
 {
-	((string*)userp)->append((char*)contents, size * nmemb);
+	static_cast<std::string *>(userp)->append(static_cast<char *>(contents), size * nmemb);
 	return size * nmemb;
 };
 
@@ -35,8 +32,8 @@ static bool fetchUrlToString(const char* url, std::string& out, long ipResolve /
 	return true;
 }
 
-vector<string> getIP_() {
-	string ipv4, ipv6;
+std::vector<std::string> getIP_() {
+	std::string ipv4, ipv6;
 
 	fetchUrlToString("https://api64.ipify.org", ipv4, CURL_IPRESOLVE_V4);
 	fetchUrlToString("https://api64.ipify.org", ipv6, CURL_IPRESOLVE_V6);
@@ -44,17 +41,17 @@ vector<string> getIP_() {
 	return {ipv4, ipv6};
 }
 
-string getIP(int n) {
+std::string getIP(int n) {
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 	auto ips = getIP_();
 	curl_global_cleanup();
 	return ips[n];
 }
 
-string getDDNS() {
+std::string getDDNS() {
 	CURL* curl;
 	CURLcode res;
-	string response;
+	std::string response;
 
 	curl = curl_easy_init();
 	if (curl) {
@@ -70,22 +67,22 @@ string getDDNS() {
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
 		res = curl_easy_perform(curl);
-		if (res != CURLE_OK) cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << endl; // debug
+		if (res != CURLE_OK) std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl; // debug
 
 		curl_easy_cleanup(curl);
 	}
 
 	curl_global_cleanup();
-	string resp = json::parse(response)["domains"][0]["ipv4Address"];
+	std::string resp = json::parse(response)["domains"][0]["ipv4Address"];
 	// cout << json::parse(response).dump(4) << endl;
 	return resp;
 }
 
 
 
-void setRoot(const string& ip) {
+void setRoot(const std::string& ip) {
 	CURL *curl;
-	string response;
+	std::string response;
 
 	curl = curl_easy_init();
 	if (curl) {
@@ -100,7 +97,7 @@ void setRoot(const string& ip) {
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
 
-		string json_req = R"({"name":")" + DDNS_URL + R"(","ipv4Address":")" + ip + "\"}";
+		std::string json_req = R"({"name":")" + DDNS_URL + R"(","ipv4Address":")" + ip + "\"}";
 
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_req.c_str());
 
@@ -109,11 +106,11 @@ void setRoot(const string& ip) {
 
 
 		res = curl_easy_perform(curl);
-		if (res != CURLE_OK) cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << endl; // debug
+		if (res != CURLE_OK) std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl; // debug
 
 		curl_easy_cleanup(curl);
 	}
-	cout << response << endl;
+	std::cout << response << std::endl;
 
 	curl_global_cleanup();
 }

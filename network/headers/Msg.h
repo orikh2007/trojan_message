@@ -4,17 +4,14 @@
 #ifndef TROJAN_MESSAGE_MSG_H
 #define TROJAN_MESSAGE_MSG_H
 
-#include <nlohmann/json.hpp>
-
+#include "networkSettings.h"
 #include <array>
 #include <cctype>
 #include <cstdint>
 #include <optional>
 #include <random>
 #include <stdexcept>
-#include <string>
 #include <string_view>
-#include <vector>
 
 using Clock = std::chrono::steady_clock;
 
@@ -178,13 +175,13 @@ inline std::optional<std::vector<uint8_t>> b64_decode(const std::string_view s) 
         int d = val(s[i + 3]);
         if (a < 0 || b < 0 || c == -1 || d == -1) return std::nullopt;
 
-        uint32_t n = (uint32_t(a) << 18) | (uint32_t(b) << 12);
-        if (c >= 0) n |= (uint32_t(c) << 6);
-        if (d >= 0) n |= uint32_t(d);
+        uint32_t n = (static_cast<uint32_t>(a) << 18) | (static_cast<uint32_t>(b) << 12);
+        if (c >= 0) n |= (static_cast<uint32_t>(c) << 6);
+        if (d >= 0) n |= static_cast<uint32_t>(d);
 
-        out.push_back(uint8_t((n >> 16) & 0xFF));
-        if (c != -2) out.push_back(uint8_t((n >> 8) & 0xFF));
-        if (d != -2) out.push_back(uint8_t(n & 0xFF));
+        out.push_back(static_cast<uint8_t>((n >> 16) & 0xFF));
+        if (c != -2) out.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
+        if (d != -2) out.push_back(static_cast<uint8_t>(n & 0xFF));
     }
 
     return out;
@@ -274,7 +271,7 @@ inline json msg_register_ack(const std::string& tx,
     json body;
     std::string you_ip = you.address().to_string();
     uint16_t you_port = you.port();
-    vector<json> peersJ;
+    std::vector<json> peersJ;
     for (auto peer : peers) {
         json peerJ;
         peerJ["id"] = peer.peerId;
