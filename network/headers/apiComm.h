@@ -7,13 +7,17 @@
 #include <curl/curl.h>
 #include <iostream>
 #include <string>
-#include "networkSettings.h"
+#include "../headers/networkSettings.h"
 using namespace std;
 string getDDNS();
-string getIP();
-void setRoot(string ip);
+vector<string> getIP_();
+void setRoot(string ipv4, string ipv6);
 
-class apiComm {
+enum IPS {
+    v4 = 0,
+    v6 = 1
 };
+string getIP(int n);
+string getDDNS();
 
 #endif //TROJAN_MESSAGE_APICOMM_H
