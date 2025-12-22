@@ -25,7 +25,6 @@ bool operator==(proto::MsgType msg, char* str);
 
 class Node : public enable_shared_from_this<Node> {
 public:
-    const string ip = getIP(v4);
     // int level;
     // int64_t nodeId;
     // int64_t parentId;
@@ -34,11 +33,14 @@ public:
     // map<asio::ip::udp::endpoint, int64_t> conns;
 
     explicit Node(const uint16_t listen_port)
-        :   io_(),
-            socket_(io_),
-            node_id_(),
-            root_ip_(),
+        :   ip_(getIP(v4)),
+            port_(listen_port),
+            ep_(udp::endpoint(asio::ip::make_address(ip_), port_)),
             is_root_(),
+            root_ip_(),
+            node_id_(),
+            io_(),
+            socket_(io_),
             clients_map_(),
             clients_()
     {
@@ -68,7 +70,18 @@ public:
 
     void become_root() {
         is_root_ = true;
-        setRoot(ip);
+        setRoot(ip_);
+
+        port_ = ROOT_PORT;
+        const auto addr = asio::ip::make_address(ip_);
+        ep_ = udp::endpoint(addr, port_);
+
+        peerInfo me;
+        me.peerId = node_id_;
+        me.ep = ep_;
+        me.last_seen = Clock::now();
+        clients_.push_back(me.peerId);
+        clients_map_[me.peerId] = me;
     }
 
     const std::string& id() {return node_id_;}
@@ -153,22 +166,38 @@ public:
     }
 
     void handle_register_ack(const std::string& tx, const peerInfo& curP, const int want) {
-        size_t size = clients_.size();
+        const size_t size = clients_.size();
         int n = min(static_cast<int>(size), 4);
         n = min(n, want);
         vector<peerInfo> peers;
+
+        std::random_device rd;
+        std::mt19937 gen {rd()};
+        ranges::shuffle(clients_, gen);
+
         for (int i = 0; i < n; ++i) {
             std::string cli = clients_.at(i);
             if (cli == curP.peerId)
                 continue;
             peers.push_back(clients_map_[cli]);
         }
-        const auto j = proto::msg_register_ack(tx, curP.ep, peers);
-        udp::endpoint registeringCli = curP.ep;
-        auto data = proto::dump_compact(j);
-        send_text(registeringCli, data);
-        std::cout << "Sent to " << registeringCli.address().to_string() << ":" << registeringCli.port() << " this:" << endl
-        << j;
+
+        const string token = proto::random_token_hex();
+
+        const json jNew = proto::msg_register_ack(tx, curP.ep, peers, token); //reg_ack json for newcomer
+        const udp::endpoint registeringCli = curP.ep;
+        const auto dataNew = proto::dump_compact(jNew); //reg_ack data for newcomer
+        send_text(registeringCli, dataNew);
+        std::cout << "Sent reg_ack to " << registeringCli.address().to_string() << ":" << registeringCli.port() << endl;
+
+        for (auto membr : peers){
+            const json jMembr = proto::msg_introduce(tx, curP, token); //introduce json for existing
+            auto epMembr = membr.ep;
+            const auto dataMembr = proto::dump_compact(jMembr);
+            send_text(epMembr, dataMembr);
+            std::cout << "Sent introduce msg to " << epMembr.address().to_string() << ":" << epMembr.port() << endl;
+        }
+
     }
 
 
@@ -243,8 +272,6 @@ private:
                 break;
             case MsgType::PEER_LIST:
                 break;
-            case MsgType::CONNECT_REQUEST:
-                break;
             case MsgType::INTRODUCE:
                 break;
             case MsgType::PUNCH:
@@ -255,6 +282,8 @@ private:
                 break;
             case MsgType::ERROR_:
                 break;
+            default:
+                std::cerr << "Message type cannot be processed: " << static_cast<int>(env.type) << endl;
         }
     }
 
@@ -285,6 +314,10 @@ private:
             std::cerr << "Bad register message from " << from.address().to_string();
         }
     };
+
+    string ip_;
+    uint16_t port_;
+    udp::endpoint ep_;
 
     bool is_root_ = false;
     std::string root_ip_;
