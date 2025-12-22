@@ -2,7 +2,7 @@
 // Created by orikh on 02/12/2025.
 //
 
-#include "../headerFiles/networking/apiComm.h"
+#include "../headers/apiComm.h"
 const std::string DDNS_API = "https://api.dynu.com/v2/";
 using json = nlohmann::json;
 using namespace std;

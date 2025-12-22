@@ -1,8 +1,9 @@
 #include <iostream>
-#include "headerFiles/networking/apiComm.h"
+#include "network/headers/apiComm.h"
+#include "network/headers/protocol.h"
 
-int main(int argc, char *argv[]) {
-    setRoot(getIP());
-    getDDNS();
+using udp = asio::ip::udp;
+
+int main() {
     return 0;
 }

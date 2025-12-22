@@ -10,14 +10,21 @@ else()
 endif()
 
 add_executable(trojan_message main.cpp
-        network/apiComm.cpp
-        headerFiles/networking/apiComm.h
-        headerFiles/networking/networkSettings.h
-        headerFiles/networking/Node.h)
+        network/source/apiComm.cpp
+        network/headers/apiComm.h
+        network/headers/networkSettings.h
+        network/headers/Node.h
+        network/headers/protocol.h
+        network/headers/msg.h
+)
 
 
 find_package(nlohmann_json REQUIRED)
-target_link_libraries(trojan_message PRIVATE CURL::libcurl)
+target_link_libraries(trojan_message PRIVATE nlohmann_json::nlohmann_json)
+
 
 find_package(CURL REQUIRED)
-target_link_libraries(trojan_message PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(trojan_message PRIVATE CURL::libcurl)
+
+find_package(asio CONFIG REQUIRED)
+target_link_libraries(trojan_message PRIVATE asio::asio)
