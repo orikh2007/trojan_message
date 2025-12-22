@@ -3,6 +3,11 @@ project(trojan_message)
 
 set(CMAKE_CXX_STANDARD 20)
 
+
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 if (MSVC)
     add_compile_options(/W4 /permissive- /EHsc)
 else()

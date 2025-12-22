@@ -4,9 +4,7 @@
 
 #ifndef TROJAN_MESSAGE_NODE_H
 #define TROJAN_MESSAGE_NODE_H
-#include "Msg.h"
-
-#endif //TROJAN_MESSAGE_NODE_H
+#include "msg.h"
 #include "Asio.h"
 #include "apiComm.h"
 #include <iostream>
@@ -103,9 +101,9 @@ public:
 
             if (cmd == "send") {
                 handle_send(iss);
-            } else if (line == "register") {
+            } else if (cmd == "register") {
                 handle_register();
-            } else if (line == "root") {
+            } else if (cmd == "root") {
                 become_root();
             } else {
                 std::cout   << "Commands:\n"
@@ -139,7 +137,6 @@ public:
         std::error_code ec;
         auto addr = asio::ip::make_address(tgt_ip, ec);
         if (ec) {
-            io_.stop();
             std::cout << "Bad IP address: " << tgt_ip << " (" << ec.message() << ")\n";
             return;
         }
@@ -311,7 +308,7 @@ private:
 
             handle_register_ack(tx, p, want);
         } catch (const std::exception& e) {
-            std::cerr << "Bad register message from " << from.address().to_string();
+            std::cerr << "Bad register message from " << from.address().to_string() << ": " << e.what();
         }
     };
 
@@ -332,3 +329,5 @@ private:
     vector<std::string> clients_;
 
 };
+
+#endif //TROJAN_MESSAGE_NODE_H
