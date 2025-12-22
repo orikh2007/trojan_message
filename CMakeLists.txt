@@ -15,7 +15,6 @@ add_executable(trojan_message
         network/headers/networkSettings.h
         network/headers/Node.h
         main.cpp
-        main.cpp
         network/source/Comm.cpp
         network/headers/Comm.h
         network/headers/Asio.h

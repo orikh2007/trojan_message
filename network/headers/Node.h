@@ -4,6 +4,7 @@
 
 #ifndef TROJAN_MESSAGE_NODE_H
 #define TROJAN_MESSAGE_NODE_H
+#include "Msg.h"
 
 #endif //TROJAN_MESSAGE_NODE_H
 #include "Asio.h"
@@ -17,16 +18,10 @@
 constexpr int ROOT_PORT = 12345;
 
 using udp = asio::ip::udp;
-using Clock = std::chrono::steady_clock;
 using MsgType = proto::MsgType;
 
 
 bool operator==(proto::MsgType msg, char* str);
-
-struct peerInfo {
-    udp::endpoint ep;
-    Clock::time_point last_seen;
-};
 
 class Node : public enable_shared_from_this<Node> {
 public:
@@ -38,46 +33,32 @@ public:
     // vector<asio::ip::udp::endpoint> children;
     // map<asio::ip::udp::endpoint, int64_t> conns;
 
-    explicit Node(const uint16_t listen_port, const uint16_t send_port)
+    explicit Node(const uint16_t listen_port)
         :   io_(),
-            recv_socket_(io_),
-            send_socket_(io_),
+            socket_(io_),
             node_id_(),
             root_ip_(),
             is_root_(),
+            clients_map_(),
             clients_()
     {
         std::error_code ec;
 
         node_id_ = proto::random_node_id_hex();
 
-        root_ip_ = getDDNS();
-
         std::cout << "Node ID: " << node_id_ << "\n";
 
-        recv_socket_.open(udp::v4(), ec);
+        socket_.open(udp::v4(), ec);
         if (ec) {
             io_.stop();
             throw std::runtime_error("socket_.open failed: " + ec.message());
         }
 
-        recv_socket_.bind(udp::endpoint(udp::v4(), listen_port), ec);
+        socket_.bind(udp::endpoint(udp::v4(), listen_port), ec);
         if (ec) {
             io_.stop();
             throw std::runtime_error("socket_.bind failed (port in use?): " + ec.message());
         }
-        send_socket_.open(udp::v4(), ec);
-        if (ec) {
-            io_.stop();
-            throw std::runtime_error("socket_.open failed: " + ec.message());
-        }
-
-        send_socket_.bind(udp::endpoint(udp::v4(), send_port), ec);
-        if (ec) {
-            io_.stop();
-            throw std::runtime_error("socket_.bind failed (port in use?): " + ec.message());
-        }
-
         std::cout << "Listening on UDP IPv4 port " << listen_port << "\n";
     }
 
@@ -85,7 +66,10 @@ public:
 
     asio::io_context& io() { return io_; }
 
-    void become_root(){ is_root_ = true; }
+    void become_root() {
+        is_root_ = true;
+        setRoot(ip);
+    }
 
     const std::string& id() {return node_id_;}
 
@@ -124,6 +108,7 @@ public:
         }
 
     }
+
     void handle_send(istringstream& iss) {
         std::string tgt_ip;
         int port_int = 0;
@@ -152,9 +137,10 @@ public:
     }
 
     void handle_register() {
-        const auto j = proto::msg_register(node_id_, recv_socket_.local_endpoint().port(), 1);
+        const auto j = proto::msg_register(node_id_, socket_.local_endpoint().port(), 1);
         const auto data = proto::dump_compact(j);
         std::error_code ec;
+        root_ip_ = getDDNS();
         const auto addr = asio::ip::make_address(root_ip_, ec);
         if (ec) {
             io_.stop();
@@ -166,11 +152,30 @@ public:
         std::cout << "Sent (async) to " << root_ip_ << ":" << ROOT_PORT << "\n";
     }
 
+    void handle_register_ack(const std::string& tx, const peerInfo& curP, const int want) {
+        size_t size = clients_.size();
+        int n = min(static_cast<int>(size), 4);
+        n = min(n, want);
+        vector<peerInfo> peers;
+        for (int i = 0; i < n; ++i) {
+            std::string cli = clients_.at(i);
+            if (cli == curP.peerId)
+                continue;
+            peers.push_back(clients_map_[cli]);
+        }
+        const auto j = proto::msg_register_ack(tx, curP.ep, peers);
+        udp::endpoint registeringCli = curP.ep;
+        auto data = proto::dump_compact(j);
+        send_text(registeringCli, data);
+        std::cout << "Sent to " << registeringCli.address().to_string() << ":" << registeringCli.port() << " this:" << endl
+        << j;
+    }
+
 
 private:
     void send_text(const udp::endpoint& target, const std::string& text) {
         auto data = make_shared<std::string>(text);
-        send_socket_.async_send_to(
+        socket_.async_send_to(
             asio::buffer(*data),
             target,
             [self = shared_from_this(), data](const std::error_code& ec, std::size_t bytes) {
@@ -185,7 +190,7 @@ private:
     }
 
     void start_receive() {
-        recv_socket_.async_receive_from(
+        socket_.async_receive_from(
             asio::buffer(recv_buf_),
             remote_,
             [self = shared_from_this()](std::error_code ec, std::size_t n) {
@@ -200,7 +205,7 @@ private:
             if (!io_.stopped()) start_receive();
             return;
         }
-
+        std::cout << "received message from " << remote_ << endl;
         // Copy data NOW (recv_buf_ will be reused next receive)
         std::string msg(recv_buf_.data(), recv_buf_.data() + n);
         auto from = remote_; // copy endpoint
@@ -216,7 +221,8 @@ private:
 
     void process_receive(udp::endpoint& from, const std::string &msg) {
         try {
-            proto::Envelope env = proto::parse_envelope(msg);
+            const proto::Envelope env = proto::parse_envelope(msg);
+
             process_msg(from, env);
         } catch (const std::exception& e) {
             std::cerr << "Bad message from "
@@ -225,7 +231,8 @@ private:
         }
     }
 
-    void process_msg(udp::endpoint& from, proto::Envelope env) {
+    void process_msg(udp::endpoint& from, const proto::Envelope& env) {
+        std::cout << "processing message" << endl;
         switch (env.type) {
             case MsgType::REGISTER:
                 process_register(from, env);
@@ -251,36 +258,44 @@ private:
         }
     }
 
-    void process_register(const udp::endpoint& from, proto::Envelope env) {
+    void process_register(const udp::endpoint& from, const proto::Envelope& env) {
         if (!is_root_) {
             std::cerr << "I'M GROOT (NOT ROOT, DONT REGISTER HERE!)";
             return;
         }
         try {
-            map<std::string, anyV> client;
             peerInfo p;
+            if (env.body["listen_port"] != from.port())
+                std::cerr << "register listen port is different from sending port" << endl;
             p.ep = from;
             p.last_seen = Clock::now();
-            clients_[env.src] = p;
+            p.peerId = env.src;
+            clients_map_[env.src] = p;
+            clients_.push_back(p.peerId);
 
-            std::cout << "peer " << env.src << " registered\n";
-            std::cout << "here's his info: " << clients_[env.src].ep.address() << ":" << clients_[env.src].ep.port() << endl;
+            int want = env.body["want_peers"];
+
+            std::string tx = env.tx;
+
+            std::cout   << "peer " << env.src << " registered\n";
+            std::cout   << "here's his info: " << clients_map_[p.peerId].ep.address() << ":" << clients_map_[env.src].ep.port() << endl;
+
+            handle_register_ack(tx, p, want);
         } catch (const std::exception& e) {
             std::cerr << "Bad register message from " << from.address().to_string();
         }
     };
 
-
-    bool is_root_;
+    bool is_root_ = false;
     std::string root_ip_;
     std::string node_id_;
     asio::io_context io_;
-    udp::socket recv_socket_;
-    udp::socket send_socket_;
+    udp::socket socket_;
     udp::endpoint remote_;
     std::array<char, 2048> recv_buf_{};
 
     using anyV = std::variant<udp::endpoint, std::string, std::chrono::steady_clock::time_point>;
-    map<std::string, peerInfo> clients_;
+    map<std::string, peerInfo> clients_map_;
+    vector<std::string> clients_;
 
 };

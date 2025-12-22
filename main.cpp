@@ -10,9 +10,9 @@ int main(int argc, char *argv[]) {
     try {
         int listen_p = 12345;
         int send_p = 12346;
-        auto me = std::make_shared<Node>(listen_p, send_p);
+        auto me = std::make_shared<Node>(listen_p);
         me->start();
-
+        std::cout << "getDDNS: " << getDDNS() << endl;
         std::thread net_thread([me] {
             try {
                 me->io().run();
@@ -24,8 +24,8 @@ int main(int argc, char *argv[]) {
         std::cout   << "CLI ready.\n"
                     << "Commands:\n"
                     << "  send <ip> <port> <message>\n"
-                << "  quit\n"
-                << std::flush;
+                    << "  quit\n"
+                    << std::flush;
 
         std::string line;
         while (std::getline(std::cin, line)) {

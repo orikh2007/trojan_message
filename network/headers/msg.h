@@ -16,6 +16,14 @@
 #include <string_view>
 #include <vector>
 
+using Clock = std::chrono::steady_clock;
+
+struct peerInfo {
+    udp::endpoint ep;
+    Clock::time_point last_seen;
+    std::string peerId;
+};
+
 namespace proto {
 using json = nlohmann::json;
 
@@ -258,12 +266,23 @@ inline json msg_register(const std::string& node_id, uint16_t listen_port, int w
 }
 
 inline json msg_register_ack(const std::string& tx,
-                             const std::string& you_ip, uint16_t you_port,
-                             const std::vector<json>& peers,
+                             const udp::endpoint you,
+                             const std::vector<peerInfo>& peers,
                              int ka_sec = 15) {
     json body;
+    std::string you_ip = you.address().to_string();
+    uint16_t you_port = you.port();
+    vector<json> peersJ;
+    for (auto peer : peers) {
+        json peerJ;
+        peerJ["id"] = peer.peerId;
+        peerJ["ip"] = peer.ep.address().to_string();
+        peerJ["port"] = peer.ep.port();
+        peersJ.push_back(peerJ);
+    }
+
     body["you"] = {{"ip", you_ip}, {"port", you_port}};
-    body["peers"] = peers; // each peer: {"id","ip","port"}
+    body["peers"] = peersJ; // each peer: {"id","ip","port"}
     body["ka_sec"] = ka_sec;
     return make_envelope(MsgType::REGISTER_ACK, "ROOT", tx, body);
 }

@@ -60,7 +60,7 @@ string getDDNS() {
 	if (curl) {
 		curl_easy_setopt(curl, CURLOPT_URL, "https://api.dynu.com/v2/dns/");
 
-		struct curl_slist* headers = NULL;
+		struct curl_slist* headers = nullptr;
 		headers = curl_slist_append(headers, "Host: api.dynu.com");
 		headers = curl_slist_append(headers, "accept: application/json");
 		headers = curl_slist_append(headers, ("API-Key: " + DDNS_API_KEY).c_str());
@@ -83,7 +83,7 @@ string getDDNS() {
 
 
 
-void setRoot(string ipv4, string ipv6) {
+void setRoot(const string& ip) {
 	CURL *curl;
 	CURLcode res;
 	string response;
@@ -92,7 +92,7 @@ void setRoot(string ipv4, string ipv6) {
 	if (curl) {
 		curl_easy_setopt(curl, CURLOPT_URL, ("https://api.dynu.com/v2/dns/"+DDNS_ID).c_str());
 
-		struct curl_slist* headers = NULL;
+		struct curl_slist* headers = nullptr;
 		headers = curl_slist_append(headers, "Host: api.dynu.com");
 		headers = curl_slist_append(headers, "accept: application/json");
 		headers = curl_slist_append(headers, ("API-Key: " + DDNS_API_KEY).c_str());
@@ -100,7 +100,7 @@ void setRoot(string ipv4, string ipv6) {
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
 
-		string json_req = "{\"name\":\"" + DDNS_URL + "\",\"ipv4Address\":\"" + ipv4 + "\",\"ipv6Address\":\"" + ipv6 + "\"}";
+		string json_req = R"({"name":")" + DDNS_URL + R"(","ipv4Address":")" + ip + "\"}";
 
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_req.c_str());
 

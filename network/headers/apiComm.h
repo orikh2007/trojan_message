@@ -11,13 +11,12 @@
 using namespace std;
 string getDDNS();
 vector<string> getIP_();
-void setRoot(string ipv4, string ipv6);
+void setRoot(const string& ip);
+string getIP(int n);
 
 enum IPS {
     v4 = 0,
     v6 = 1
 };
-string getIP(int n);
-string getDDNS();
 
 #endif //TROJAN_MESSAGE_APICOMM_H
