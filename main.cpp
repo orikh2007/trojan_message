@@ -9,7 +9,7 @@ int main(int argc, char *argv[]) {
         int listen_p = 12345;
         auto me = std::make_shared<Node>(listen_p);
         me->start();
-        std::cout << "getDDNS: " << getDDNS() << std::endl;
+        std::cout << "Current root: " << getDDNS() << std::endl;
         std::thread net_thread([me] {
             try {
                 me->io().run();

@@ -23,8 +23,6 @@ add_executable(trojan_message
         network/headers/msg.h
         network/source/Node.cpp
         network/source/Node.cpp
-        network/headers/protocol.h
-        network/headers/protocol.h
 )
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 

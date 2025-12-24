@@ -19,6 +19,10 @@ struct peerInfo {
     udp::endpoint ep;
     Clock::time_point last_seen;
     std::string peerId;
+    std::string tkn;
+    peerInfo() = default;
+    peerInfo(udp::endpoint endp, std::string p_id, std::string tok) : ep(std::move(endp)), last_seen(Clock::now()),
+    peerId(std::move(p_id)), tkn(std::move(tok)) {}
 };
 
 namespace proto {
@@ -263,10 +267,10 @@ inline json msg_register(const std::string& node_id, uint16_t listen_port, int w
 }
 
 inline json msg_register_ack(const std::string& tx,
-                             const udp::endpoint you,
+                             const udp::endpoint &you,
                              const std::vector<peerInfo>& peers,
                              const std::string& token_hex,
-                             int ka_sec = 15, int punch_ms = 250, int timeout_ms = 4000) {
+                             int ka_ms = 15000, int punch_ms = 250, int timeout_ms = 4000) {
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
     json body;
     std::string you_ip = you.address().to_string();
@@ -277,12 +281,13 @@ inline json msg_register_ack(const std::string& tx,
         peerJ["id"] = peer.peerId;
         peerJ["ip"] = peer.ep.address().to_string();
         peerJ["port"] = peer.ep.port();
+        peerJ["token"] = peer.tkn;
         peersJ.push_back(peerJ);
     }
 
     body["you"] = {{"ip", you_ip}, {"port", you_port}};
     body["peers"] = peersJ; // each peer: {"id","ip","port"}
-    body["ka_sec"] = ka_sec;
+    body["ka_ms"] = ka_ms;
     body["token"] = token_hex;
     body["punch_ms"] = punch_ms;
     body["timeout_ms"] = timeout_ms;
@@ -302,16 +307,15 @@ inline json msg_keepalive(const std::string& node_id) {
     // return make_envelope(MsgType::CONNECT_REQUEST, node_id, random_tx_id(), body);
 // } //connect request - used reg_ack in instead (easier to understand)
 
-inline json msg_introduce(const std::string& tx,
-                          const peerInfo& peer,
+inline json msg_introduce(const peerInfo& peer,
                           const std::string& token_hex,
-                          int ka_sec = 15, int punch_ms = 250, int timeout_ms = 4000) {
+                          int ka_ms = 15000, int punch_ms = 250, int timeout_ms = 4000) {
     require(peer.peerId.size() == 16 && is_hex(peer.peerId), "peer.id must be 16 hex chars");
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
 
     json body;
     body["peer"] = {{"id", peer.peerId}, {"ip", peer.ep.address().to_string()}, {"port", peer.ep.port()}};
-    body["ka_sec"] = ka_sec;
+    body["ka_ms"] = ka_ms;
     body["token"] = token_hex;
     body["punch_ms"] = punch_ms;
     body["timeout_ms"] = timeout_ms;
