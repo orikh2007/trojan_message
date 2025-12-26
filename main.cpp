@@ -6,7 +6,12 @@
 
 int main(int argc, char *argv[]) {
     try {
-        int listen_p = 12345;
+        int listen_p;
+        do {
+            std::cout << "enter port: ";
+            std::cin >> listen_p;
+        } while (listen_p > UINT16_MAX || listen_p <= 0);
+
         auto me = std::make_shared<Node>(listen_p);
         me->start();
         std::cout << "Current root: " << getDDNS() << std::endl;

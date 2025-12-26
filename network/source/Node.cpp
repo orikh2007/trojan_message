@@ -13,6 +13,7 @@ Node::Node(const uint16_t listen_port)
             node_id_(),
             io_(),
             socket_(io_),
+            recv_(true),
             clients_map_(),
             clients_()
 {
@@ -36,7 +37,10 @@ Node::Node(const uint16_t listen_port)
     std::cout << "Listening on UDP IPv4 port " << listen_port << "\n";
 } //constructor
 
-void Node::start() { start_receive(); } //start the receiving io "loop"
+void Node::start() {
+    recv_ = true;
+    start_receive();
+} //start the receiving io "loop"
 
 asio::io_context& Node::io() { return io_; } //get io context
 
@@ -54,7 +58,32 @@ void Node::become_root() {
     me.last_seen = Clock::now();
     clients_.push_back(me.peerId);
     clients_map_.insert_or_assign(me.peerId, me);
+    rebind();
 } //become the root - tell dynu and everyone you're the root
+
+void Node::rebind() {
+    asio::post(io_, [self = shared_from_this()] {
+        std::error_code ec;
+
+        // 1) cancel pending ops (will trigger operation_aborted in handler)
+        self->socket_.cancel(ec);
+
+        // 2) close old socket
+        self->socket_.close(ec);
+
+        // 3) open + bind new port
+        self->socket_.open(udp::v4(), ec);
+        if (ec) { std::cerr << "open failed: " << ec.message() << "\n"; return; }
+
+        self->socket_.bind(udp::endpoint(udp::v4(), self->port_), ec);
+        if (ec) { std::cerr << "bind failed: " << ec.message() << "\n"; return; }
+
+        std::cout << "Rebound to UDP port " << self->port_ << "\n";
+
+        // 4) re-arm receive
+        self->start_receive();
+    });
+}
 
 const std::string& Node::id() {return node_id_;} //get node id
 
@@ -121,7 +150,7 @@ void Node::handle_send(std::istringstream& iss) {
 } //send someone a message - temporary
 
 void Node::handle_register() {
-    const auto j = proto::msg_register(node_id_, socket_.local_endpoint().port(), 1);
+    const auto j = proto::msg_register(node_id_, socket_.local_endpoint().port(), 3);
     const auto data = proto::dump_compact(j);
     std::error_code ec;
     root_ip_ = getDDNS();
@@ -173,12 +202,16 @@ void Node::handle_register_ack(const std::string& tx, const peerInfo& curP, cons
                                                                                                   * sends registering client his peers and token,
                                                                                                   * and tells the peers to connect to the registering client
                                                                                                   */
-void Node::start_punch(const peerInfo p, const int timeout, const int punch_ms, std::string tkn) {
-    std::cout << "trying to punch: " << p.ep.address().to_string() << std::endl;
+void Node::start_punch(const peerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
+    std::cout << "Trying to punch: " << p.ep.address().to_string() << std::endl;
     auto& slot = connections_[p.peerId];
     slot = std::make_unique<Connection>(io_, p.ep, tkn);
     slot->tries = 0;
     slot->connected = false;
+
+    std::cout << "[START_PUNCH] peerId=" << p.peerId
+              << " ep=" << p.ep.address().to_string() << ":" << p.ep.port()
+              << " token=" << tkn << "\n";
 
     punch(p.peerId, timeout, punch_ms);
 }
@@ -194,13 +227,19 @@ void Node::punch(const std::string& peerId, const int timeout, const int punch_m
 
     a.tries++;
 
+
+
     if (a.tries >= 8) {
         std::cerr << "failed punching " << a.ep.address().to_string() << ":" << a.ep.port() << ":(" << std::endl;
         connections_.erase(it);
         return;
     }
-
-    a.timer.expires_after(std::chrono::milliseconds(punch_ms) + std::chrono::milliseconds(50 * a.tries));
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    uint64_t x = gen();
+    auto jitt = x%10;
+    std::cout << "JITTER " << jitt << std::endl;
+    a.timer.expires_after(std::chrono::milliseconds(punch_ms) + std::chrono::milliseconds(10 * a.tries) + std::chrono::milliseconds(jitt));
     a.timer.async_wait([self = shared_from_this(), peerId, timeout, punch_ms](const std::error_code& ec){
         if (ec) return;
         self->punch(peerId, timeout, punch_ms);
@@ -217,7 +256,7 @@ void Node::send_text(const udp::endpoint& target, std::string text) {
                 std::cerr << "send error: " << ec.message() << "\n";
             }
             else {
-                std::cout << "sent " << bytes << "\n";
+                std::cout << "sent " << bytes << " from " << self->socket_.local_endpoint().address().to_string() <<":" << self->socket_.local_endpoint().port() <<"\n";
             }
     });
 } //sends string text to target.
@@ -234,11 +273,14 @@ void Node::start_receive() {
 
 void Node::on_receive(const std::error_code& ec, std::size_t n) {
     if (ec) {
-        std::cerr << "recv error: " << ec.message() << "\n";
+        if (ec == asio::error::operation_aborted) {
+            // This happens when we close/cancel the socket on purpose.
+            return;
+        }
+        std::cerr << "recv error: " << ec.message() << " w/ " << n << " bytes\n";
         if (!io_.stopped()) start_receive();
         return;
     }
-    std::cout << "received message from " << remote_ << std::endl;
     // Copy data NOW (recv_buf_ will be reused next receive)
     std::string msg(recv_buf_.data(), recv_buf_.data() + n);
     auto from = remote_; // copy endpoint
@@ -255,7 +297,7 @@ void Node::on_receive(const std::error_code& ec, std::size_t n) {
 void Node::process_receive(udp::endpoint& from, const std::string &msg) {
     try {
         const proto::Envelope env = proto::parse_envelope(msg);
-
+        std::cout << "RECV from " << from.address().to_string() << ":" << from.port() << " | Type: " << proto::to_string(env.type) << std::endl;
         process_msg(from, env);
     } catch (const std::exception& e) {
         std::cerr << "Bad message from "
@@ -274,6 +316,8 @@ void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
             on_register_ack(from, env);
             break;
         case MsgType::KEEPALIVE:
+            std::cout << "received keep alive from: " << from.address().to_string() << std::endl;
+            clients_map_[env.src].last_seen = Clock::now();
             break;
         case MsgType::PEER_LIST:
             break;
@@ -302,8 +346,6 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
     }
     try {
         peerInfo p;
-        if (env.body["listen_port"] != from.port())
-            std::cerr << "register listen port is different from sending port" << std::endl;
         p.ep = from;
         p.last_seen = Clock::now();
         p.peerId = env.src;
@@ -356,6 +398,7 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
 
         for (auto p : peers) {
             remember_token(p.peerId, p.tkn, 6000);
+            std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
             start_punch(p, timeout, punch_ms, p.tkn);
         }
     } catch (const std::exception& e) {
@@ -377,6 +420,7 @@ void Node::prune_tokens() {
         else ++it;
     }
 }
+
 void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     if (env.src != "ROOT" || from.address().to_string() != root_ip_)
         std::cerr << "Received reg_ack from not-root" << std::endl;
@@ -405,6 +449,8 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
 
     peerInfo p(udp::endpoint(pAddr, pPort), peer_id, tkn);
 
+    std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
+
     start_punch(p, timeout, punch_ms, tkn);
 }
 
@@ -416,6 +462,7 @@ void Node::mark_connected(std::string tkn, const std::string &node_id, udp::endp
     cur->punch_token = tkn;
     cur->connected = true;
     cur->timer.cancel();
+    keep_alive(node_id);
 }
 
 bool Node::token_is_known(std::string tkn, udp::endpoint from, std::string n_id) {
@@ -477,5 +524,31 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
     a.timer.cancel();
 
     std::cout << "Success! connected to: " << senderId << " on " << from.address().to_string() << ":" << from.port() <<std::endl;
+}
+
+void Node::keep_alive(const std::string& peerId) {
+    auto it = connections_.find(peerId);
+    if (it == connections_.end() || !it->second) {
+        std::cerr << "tried to keep_alive with a non-existing connection" << std::endl;
+        return;
+    }
+    Connection& conn = *it->second;
+
+    udp::endpoint ep = conn.ep;
+    json j = proto::msg_keepalive(node_id_);
+    auto data = proto::dump_compact(j);
+
+    std::cout << "sent keep alive to: " << conn.ep.address().to_string() << std::endl;
+
+    send_text(conn.ep, data);
+
+    conn.ka_timer.expires_after(std::chrono::milliseconds(conn.ka_ms));
+    conn.ka_timer.async_wait([self = shared_from_this(), peerId](const std::error_code ec) {
+        if (ec) {
+            std::cerr << "ka_timer async wait failed: " << ec.message() << std::endl;
+            return;
+        }
+        self->keep_alive(peerId);
+    });
 }
 

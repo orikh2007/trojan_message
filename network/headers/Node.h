@@ -21,6 +21,7 @@ struct Connection {
     std::string punch_token;
     int tries = 0;
     bool connected = false;
+    int ka_ms = 15000;
     asio::steady_timer timer;
     asio::steady_timer ka_timer;
 
@@ -46,6 +47,8 @@ public:
     asio::io_context& io();
 
     void become_root();
+
+    void rebind();
 
     const std::string& id();
 
@@ -88,10 +91,11 @@ private:
     void handle_register_ack(const std::string& tx,
         const peerInfo& curP, const int want);
 
-    void start_punch(peerInfo p, int timeout, int punch_ms, std::string tkn);
+    void start_punch(const peerInfo &p, int timeout, int punch_ms, const std::string &tkn);
 
     void punch(const std::string& peerId, int timeout, int punch_ms);
 
+    void keep_alive(const std::string &peerId);
 
 
     std::string ip_;
@@ -104,6 +108,7 @@ private:
     asio::io_context io_;
     udp::socket socket_;
     udp::endpoint remote_;
+    bool recv_;
     std::array<char, 2048> recv_buf_{};
 
     using anyV = std::variant<udp::endpoint, std::string, std::chrono::steady_clock::time_point>;

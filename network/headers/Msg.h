@@ -270,7 +270,7 @@ inline json msg_register_ack(const std::string& tx,
                              const udp::endpoint &you,
                              const std::vector<peerInfo>& peers,
                              const std::string& token_hex,
-                             int ka_ms = 15000, int punch_ms = 250, int timeout_ms = 4000) {
+                             int ka_ms = 15000, int punch_ms = 100, int timeout_ms = 4000) {
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
     json body;
     std::string you_ip = you.address().to_string();
