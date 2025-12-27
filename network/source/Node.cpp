@@ -124,29 +124,39 @@ void Node::handle_command(const std::string& line) {
 } //handle the cli command - temporary
 
 void Node::handle_send(std::istringstream& iss) {
-    std::string tgt_ip;
+    std::string to_id;
     int port_int = 0;
-    iss >> tgt_ip >> port_int;
+    iss >> to_id;
 
-    if (tgt_ip.empty() || port_int <= 0 || port_int > 65535) {
-        std::cout << "Usage: send <ip> <port> <message>\n";
+    if (to_id.empty()) {
+        std::cout << "Usage: send <to_id> <message>\n";
         return;
     }
+    try {
+        auto& p = *connections_.at(to_id);
+    udp::endpoint tgt_ep = p.ep;
 
     std::string msg;
     std::getline(iss, msg);
     if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
 
-    std::error_code ec;
-    auto addr = asio::ip::make_address(tgt_ip, ec);
-    if (ec) {
-        std::cout << "Bad IP address: " << tgt_ip << " (" << ec.message() << ")\n";
-        return;
-    }
+    std::cout << to_id << ", " << p.ep.address().to_string() << ", " << p.ep.port() << ", " << std::endl;
 
-    udp::endpoint ep(addr, static_cast<uint16_t>(port_int));
-    send_text(ep, msg);
-    std::cout << "Sent (async) to " << tgt_ip << ":" << port_int << "\n";
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    uint64_t x = gen();
+
+    auto seq = x%500;
+
+    json j = proto::msg_data_b64(node_id_, to_id, seq, proto::to_bytes(msg));
+
+    auto data = proto::dump_compact(j);
+
+    send_text(tgt_ep, data);
+    std::cout << "Sent (async) to " << tgt_ep.address().to_string() << ":" << tgt_ep.port() << "\n";
+    } catch (std::exception e) {
+        std::cerr << "Exception trying to send msg: " << e.what() <<std::endl;
+    }
 } //send someone a message - temporary
 
 void Node::handle_register() {
@@ -175,7 +185,7 @@ void Node::handle_register_ack(const std::string& tx, const peerInfo& curP, cons
     std::mt19937 gen {rd()};
     std::ranges::shuffle(clients_, gen);
 
-    for (size_t i = 0; i < clients_.size() && peers.size() < (size_t)n; ++i) {
+    for (size_t i = 0; i < clients_.size() && peers.size() < static_cast<size_t>(n); ++i) {
         const std::string& cli = clients_[i];
         if (cli == curP.peerId) continue;
         clients_map_.at(cli).tkn = proto::random_token_hex();
@@ -251,12 +261,12 @@ void Node::send_text(const udp::endpoint& target, std::string text) {
     socket_.async_send_to(
         asio::buffer(*data),
         target,
-        [self = shared_from_this(), data](const std::error_code& ec, std::size_t bytes) {
+        [self = shared_from_this(), data, target](const std::error_code& ec, std::size_t bytes) {
             if (ec){
                 std::cerr << "send error: " << ec.message() << "\n";
             }
             else {
-                std::cout << "sent " << bytes << " from " << self->socket_.local_endpoint().address().to_string() <<":" << self->socket_.local_endpoint().port() <<"\n";
+                std::cout << "SEND to " << target.address().to_string() << ":" << target.port() << ": " << data.get() << std::endl;
             }
     });
 } //sends string text to target.
@@ -331,6 +341,7 @@ void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
             on_punch_ack(from, env);
             break;
         case MsgType::DATA:
+            on_data(from, env);
             break;
         case MsgType::ERROR_:
             break;
@@ -368,7 +379,7 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
 void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env) {
     try {
         if (env.src != "ROOT" || from.address().to_string() != root_ip_)
-            std::cerr << "Received reg_ack from not-root" << std::endl;
+            std::cerr << "Received reg_ack from not-root: " << env.src << " data: " << env.body << std::endl;
 
         json body = env.body;
 
@@ -384,7 +395,7 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
                 p.ep = peerEp;
                 p.last_seen = Clock::now();
                 p.peerId = jp.at("id").get<std::string>();
-                p.tkn    = jp.at("token").get<std::string>();
+                p.tkn = jp.at("token").get<std::string>();
                 peers.push_back(p);
             } else {
                 std::cerr << "Peer's address: " << jp.at("ip") << ", couldn't be used" << ec.message() << std::endl;
@@ -396,7 +407,7 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
         int ka = env.body["ka_ms"];
         std::string tkn = env.body["token"];
 
-        for (auto p : peers) {
+        for (const auto& p : peers) {
             remember_token(p.peerId, p.tkn, 6000);
             std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
             start_punch(p, timeout, punch_ms, p.tkn);
@@ -422,8 +433,8 @@ void Node::prune_tokens() {
 }
 
 void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
-    if (env.src != "ROOT" || from.address().to_string() != root_ip_)
-        std::cerr << "Received reg_ack from not-root" << std::endl;
+    if (env.src != "ROOT")
+        std::cerr << "Received introduce from not-root: " << env.src << " data: " << env.body << std::endl;
 
     const json& body = env.body;
 
@@ -524,6 +535,15 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
     a.timer.cancel();
 
     std::cout << "Success! connected to: " << senderId << " on " << from.address().to_string() << ":" << from.port() <<std::endl;
+}
+
+void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
+    auto& b = env.body;
+    auto data = proto::data_payload_bytes(env);
+    if (!data) return;
+    std::string msg(data->begin(), data->end());
+
+    std::cout << "Got DATA from: " << env.src << " saying: " << msg << std::endl;
 }
 
 void Node::keep_alive(const std::string& peerId) {

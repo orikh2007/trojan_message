@@ -337,6 +337,10 @@ inline json msg_punch_ack(const std::string& node_id, const std::string& token_h
     return make_envelope(MsgType::PUNCH_ACK, node_id, random_tx_id(), body);
 }
 
+inline  std::vector<uint8_t> to_bytes(const std::string& s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+}
+
 inline json msg_data_b64(const std::string& node_id, const std::string& to_id,
                          uint32_t seq, const std::vector<uint8_t>& payload_bytes) {
     /*

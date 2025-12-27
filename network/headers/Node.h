@@ -84,6 +84,8 @@ private:
 
     void on_punch_ack(const udp::endpoint &from, const proto::Envelope &env);
 
+    void on_data(const udp::endpoint &from, const proto::Envelope &env);
+
     void handle_send(std::istringstream& iss);
 
     void handle_register();
