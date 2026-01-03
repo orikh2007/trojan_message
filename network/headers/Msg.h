@@ -43,7 +43,8 @@ enum class MsgType {
     PUNCH,
     PUNCH_ACK,
     DATA,
-    ERROR_
+    ERROR_,
+    DISCONNECT
 };
 
 inline std::string to_string(const MsgType t) {
@@ -363,6 +364,11 @@ inline json msg_error(const std::string& tx, std::string code, std::string detai
     body["code"] = std::move(code);
     body["detail"] = std::move(detail);
     return make_envelope(MsgType::ERROR_, "ROOT", tx, body);
+}
+
+inline json msg_disconnect(const std::string& node_id) {
+    const json body;
+    return make_envelope(MsgType::DISCONNECT, node_id, random_tx_id(), body);
 }
 
 // ---------------------------

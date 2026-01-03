@@ -3,6 +3,25 @@
 //
 
 #include "../headers/apiComm.h"
+
+namespace {
+	struct CurlGlobal {
+		CurlGlobal() {
+			auto rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+			if (rc != 0) throw std::runtime_error("curl_global_init failed");
+		}
+		~CurlGlobal() {
+			curl_global_cleanup();
+		}
+	};
+
+	// Ensures init happens exactly once, lazily, and AFTER main starts calling functions.
+	void ensure_curl_global() {
+		static CurlGlobal g;
+	}
+} // namespace
+
+
 static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* userp)
 {
 	static_cast<std::string *>(userp)->append(static_cast<char *>(contents), size * nmemb);
@@ -12,6 +31,9 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* use
 static size_t writeData(void* buffer, size_t size, size_t nmemb, void* userp) {return size * nmemb;}
 
 static bool fetchUrlToString(const char* url, std::string& out, long ipResolve /* CURL_IPRESOLVE_* */) {
+	ensure_curl_global();
+
+	std::cout << "trying to get IP" << std::endl;
 	CURL* curl = curl_easy_init();
 	if (!curl) return false;
 
@@ -35,14 +57,12 @@ static bool fetchUrlToString(const char* url, std::string& out, long ipResolve /
 std::vector<std::string> getIP_() {
 	std::string ipv4, ipv6;
 
-	fetchUrlToString("https://api64.ipify.org", ipv4, CURL_IPRESOLVE_V4);
-	fetchUrlToString("https://api64.ipify.org", ipv6, CURL_IPRESOLVE_V6);
-
+	bool ipv4_bool = fetchUrlToString("https://api64.ipify.org", ipv4, CURL_IPRESOLVE_V4);
 	return {ipv4, ipv6};
 }
 
 std::string getIP(int n) {
-	curl_global_init(CURL_GLOBAL_DEFAULT);
+	std::cout << "getting ip" << std::endl;
 	auto ips = getIP_();
 	curl_global_cleanup();
 	return ips[n];
@@ -81,6 +101,7 @@ std::string getDDNS() {
 
 
 void setRoot(const std::string& ip) {
+	ensure_curl_global();
 	CURL *curl;
 	std::string response;
 

@@ -1,22 +1,24 @@
 //
 // Created by orikh on 22/12/2025.
 //
+
 #include "../headers/Node.h"
 
 
 Node::Node(const uint16_t listen_port)
-        :   ip_(getIP(v4)),
-            port_(listen_port),
-            ep_(udp::endpoint(asio::ip::make_address(ip_), port_)),
-            is_root_(),
-            root_ip_(),
-            node_id_(),
-            io_(),
-            socket_(io_),
-            recv_(true),
-            clients_map_(),
-            clients_()
-{
+    : ip_(getIP(v4)),
+      port_(listen_port),
+      ep_(udp::endpoint(asio::ip::make_address(ip_), port_)),
+      is_root_(),
+      root_ip_(),
+      node_id_(),
+      io_(),
+      socket_(io_),
+      recv_(true),
+      cur_connections_(0),
+      clients_map_(),
+      clients_() {
+    std::cout << "starting node init" << std::endl;
     std::error_code ec;
 
     node_id_ = proto::random_node_id_hex();
@@ -108,6 +110,8 @@ void Node::handle_command(const std::string& line) {
             handle_register();
         } else if (cmd == "root") {
             become_root();
+        } else if (cmd == "dis") {
+
         } else {
             std::cout   << "Commands:\n"
                         << "  send <ip> <port> <message>\n"
@@ -327,7 +331,7 @@ void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
             break;
         case MsgType::KEEPALIVE:
             std::cout << "received keep alive from: " << from.address().to_string() << std::endl;
-            clients_map_[env.src].last_seen = Clock::now();
+            connections_[env.src]->last_seen = Clock::now();
             break;
         case MsgType::PEER_LIST:
             break;
@@ -344,6 +348,9 @@ void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
             on_data(from, env);
             break;
         case MsgType::ERROR_:
+            break;
+        case MsgType::DISCONNECT:
+            on_disconnect(from, env);
             break;
         default:
             std::cerr << "Message type cannot be processed: " << static_cast<int>(env.type) << std::endl;
@@ -473,10 +480,11 @@ void Node::mark_connected(std::string tkn, const std::string &node_id, udp::endp
     cur->punch_token = tkn;
     cur->connected = true;
     cur->timer.cancel();
+    cur->last_seen = Clock::now();
     keep_alive(node_id);
 }
 
-bool Node::token_is_known(std::string tkn, udp::endpoint from, std::string n_id) {
+bool Node::token_is_known(std::string tkn, udp::endpoint from, const std::string &n_id) {
     prune_tokens();
 
     // Case 1: we already have an attempt/connection entry for that peer id
@@ -500,7 +508,7 @@ void Node::on_punch(const udp::endpoint& from, const proto::Envelope& env) {
     prune_tokens();
 
     // If we don't yet have a connection entry for senderId, but token is cached, allow and create.
-    if (connections_.find(senderId) == connections_.end()) {
+    if (!connections_.contains(senderId)) {
         auto itTok = token_cache_.find(tkn);
         if (itTok != token_cache_.end()) {
             // create attempt entry so future checks are exact
@@ -534,7 +542,9 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
     a.connected = true;
     a.timer.cancel();
 
-    std::cout << "Success! connected to: " << senderId << " on " << from.address().to_string() << ":" << from.port() <<std::endl;
+    cur_connections_++;
+
+    std::cout << "Success! connected to: " << senderId << " on " << from.address().to_string() << ":" << from.port() << ". Now connected to: " << cur_connections_ << std::endl;
 }
 
 void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
@@ -542,8 +552,17 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
     auto data = proto::data_payload_bytes(env);
     if (!data) return;
     std::string msg(data->begin(), data->end());
-
+    if (connections_.contains(env.src))
+        connections_[env.src]->last_seen = Clock::now();
+    else {
+        std::cerr << "Got data from unknown sender" << std::endl;
+    }
     std::cout << "Got DATA from: " << env.src << " saying: " << msg << std::endl;
+}
+
+void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
+    remove_connection(env.src);
+
 }
 
 void Node::keep_alive(const std::string& peerId) {
@@ -558,9 +577,9 @@ void Node::keep_alive(const std::string& peerId) {
     json j = proto::msg_keepalive(node_id_);
     auto data = proto::dump_compact(j);
 
-    std::cout << "sent keep alive to: " << conn.ep.address().to_string() << std::endl;
+    std::cout << "sent keep alive to: " << ep.address().to_string() << std::endl;
 
-    send_text(conn.ep, data);
+    send_text(ep, data);
 
     conn.ka_timer.expires_after(std::chrono::milliseconds(conn.ka_ms));
     conn.ka_timer.async_wait([self = shared_from_this(), peerId](const std::error_code ec) {
@@ -572,3 +591,22 @@ void Node::keep_alive(const std::string& peerId) {
     });
 }
 
+void Node::disconnect() {
+    auto conn = connections_.begin();
+
+    std::advance(conn, random_0_to_n(connections_.size()));
+
+    udp::endpoint cur = conn->second->ep;
+    std::string curId = conn->first;
+
+    json msg = proto::msg_disconnect(node_id_);
+    std::string data = proto::dump_compact(msg);
+    send_text(cur, proto::dump_compact(data));
+    remove_connection(curId);
+}
+
+void Node::remove_connection(const std::string& peerId) {
+    connections_.erase(peerId);
+    cur_connections_--;
+    std::cout << "Removed " << peerId << " As I got a new connections." << std::endl;
+}

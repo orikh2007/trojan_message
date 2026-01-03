@@ -10,7 +10,6 @@
 
 
 constexpr int MAX_CONNS = 4;
-
 constexpr int ROOT_PORT = 12345;
 
 using udp = asio::ip::udp;
@@ -22,11 +21,12 @@ struct Connection {
     int tries = 0;
     bool connected = false;
     int ka_ms = 15000;
+    Clock::time_point last_seen = Clock::now();
     asio::steady_timer timer;
     asio::steady_timer ka_timer;
 
-    Connection(asio::io_context& io, udp::endpoint endp, std::string tkn)
-        : ep(std::move(endp)), punch_token(std::move(tkn)), timer(io), ka_timer(io) {}
+    Connection(asio::io_context& io, udp::endpoint endP, std::string tkn)
+        : ep(std::move(endP)), punch_token(std::move(tkn)), timer(io), ka_timer(io) {}
 };
 
 struct TokenEntry {
@@ -36,6 +36,13 @@ struct TokenEntry {
 
 
 bool operator==(proto::MsgType msg, char* str);
+
+inline int random_0_to_n(int n) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, n);
+    return dis(gen);
+}
 
 class Node : public std::enable_shared_from_this<Node> {
 public:
@@ -78,13 +85,15 @@ private:
 
     void mark_connected(std::string tkn, const std::string &node_id, udp::endpoint ep);
 
-    bool token_is_known(std::string tkn, udp::endpoint from, std::string n_id);
+    bool token_is_known(std::string tkn, udp::endpoint from, const std::string &n_id);
 
     void on_punch(const udp::endpoint& from, const proto::Envelope& env);
 
     void on_punch_ack(const udp::endpoint &from, const proto::Envelope &env);
 
     void on_data(const udp::endpoint &from, const proto::Envelope &env);
+
+    void on_disconnect(const udp::endpoint &from, const proto::Envelope &env);
 
     void handle_send(std::istringstream& iss);
 
@@ -99,6 +108,9 @@ private:
 
     void keep_alive(const std::string &peerId);
 
+    void disconnect();
+
+    void remove_connection(const std::string &peerId);
 
     std::string ip_;
     uint16_t port_;
@@ -113,7 +125,8 @@ private:
     bool recv_;
     std::array<char, 2048> recv_buf_{};
 
-    using anyV = std::variant<udp::endpoint, std::string, std::chrono::steady_clock::time_point>;
+    int cur_connections_;
+
     std::map<std::string, peerInfo> clients_map_;
     std::vector<std::string> clients_;
     std::unordered_map<std::string, std::unique_ptr<Connection>> connections_;
