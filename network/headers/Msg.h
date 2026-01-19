@@ -12,18 +12,28 @@
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
+
+
+typedef std::string NodeId;
 
 using Clock = std::chrono::steady_clock;
 
-struct peerInfo {
+struct PeerInfo {
+    int level;
     udp::endpoint ep;
     Clock::time_point last_seen;
     std::string peerId;
     std::string tkn;
-    peerInfo() = default;
-    peerInfo(udp::endpoint endp, std::string p_id, std::string tok) : ep(std::move(endp)), last_seen(Clock::now()),
-    peerId(std::move(p_id)), tkn(std::move(tok)) {}
+    std::unordered_set<NodeId> neighbors;
+    PeerInfo() = default;
+    PeerInfo(udp::endpoint endp, std::string p_id, std::string tok) : level(0),
+        ep(std::move(endp)),
+        last_seen(Clock::now()), peerId(std::move(p_id)), tkn(std::move(tok)){
+    }
 };
+
+
 
 namespace proto {
 using json = nlohmann::json;
@@ -44,7 +54,27 @@ enum class MsgType {
     PUNCH_ACK,
     DATA,
     ERROR_,
-    DISCONNECT
+    DISCONNECT,
+    HOP,
+    LINK_UP,
+    LINK_DOWN
+};
+
+struct HopMessage {
+    MsgType type = MsgType::HOP;
+    std::string src;
+    std::string dst;
+    std::string nxt;
+    uint16_t ttl;
+    std::string payload;
+
+};
+
+struct Message {
+    MsgType type;
+    std::string src;
+    std::string dst;
+
 };
 
 inline std::string to_string(const MsgType t) {
@@ -59,6 +89,11 @@ inline std::string to_string(const MsgType t) {
         case MsgType::PUNCH_ACK:        return "PUNCH_ACK";
         case MsgType::DATA:             return "DATA";
         case MsgType::ERROR_:           return "ERROR";
+        case MsgType::DISCONNECT:       return "DISCONNECT";
+        case MsgType::HOP:              return "HOP";
+        case MsgType::LINK_UP:          return "LINK_UP";
+        case MsgType::LINK_DOWN:        return "LINK_DOWN";
+        default: return "UNKNOWN";
     }
     return "ERROR";
 }
@@ -74,6 +109,10 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "PUNCH_ACK") return MsgType::PUNCH_ACK;
     if (s == "DATA") return MsgType::DATA;
     if (s == "ERROR") return MsgType::ERROR_;
+    if (s == "DISCONNECT") return MsgType::DISCONNECT;
+    if (s == "HOP") return MsgType::HOP;
+    if (s == "LINK_UP") return MsgType::LINK_UP;
+    if (s == "LINK_DOWN") return MsgType::LINK_DOWN;
     return std::nullopt;
 }
 
@@ -269,7 +308,7 @@ inline json msg_register(const std::string& node_id, uint16_t listen_port, int w
 
 inline json msg_register_ack(const std::string& tx,
                              const udp::endpoint &you,
-                             const std::vector<peerInfo>& peers,
+                             const std::vector<PeerInfo>& peers,
                              const std::string& token_hex,
                              int ka_ms = 15000, int punch_ms = 100, int timeout_ms = 4000) {
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
@@ -283,6 +322,7 @@ inline json msg_register_ack(const std::string& tx,
         peerJ["ip"] = peer.ep.address().to_string();
         peerJ["port"] = peer.ep.port();
         peerJ["token"] = peer.tkn;
+        peerJ["level"] = peer.level;
         peersJ.push_back(peerJ);
     }
 
@@ -308,7 +348,19 @@ inline json msg_keepalive(const std::string& node_id) {
     // return make_envelope(MsgType::CONNECT_REQUEST, node_id, random_tx_id(), body);
 // } //connect request - used reg_ack in instead (easier to understand)
 
-inline json msg_introduce(const peerInfo& peer,
+inline json msg_linkup(const NodeId& peer, const NodeId& src) {
+    json body;
+    body["peer"] = peer;
+    return make_envelope(MsgType::LINK_UP, src, random_tx_id(), body);
+}
+
+inline json msg_linkdown(const NodeId& peer, const NodeId& src) {
+    json body;
+    body["peer"] = peer;
+    return make_envelope(MsgType::LINK_DOWN, src, random_tx_id(), body);
+}
+
+inline json msg_introduce(const PeerInfo& peer,
                           const std::string& token_hex,
                           int ka_ms = 15000, int punch_ms = 250, int timeout_ms = 4000) {
     require(peer.peerId.size() == 16 && is_hex(peer.peerId), "peer.id must be 16 hex chars");
@@ -324,17 +376,19 @@ inline json msg_introduce(const peerInfo& peer,
     return make_envelope(MsgType::INTRODUCE, "ROOT", random_tx_id(), body);
 }
 
-inline json msg_punch(const std::string& node_id, const std::string& token_hex) {
+inline json msg_punch(const std::string& node_id, const std::string& token_hex, int level) {
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
     json body;
     body["token"] = token_hex;
+    body["level"] = level;
     return make_envelope(MsgType::PUNCH, node_id, random_tx_id(), body);
 }
 
-inline json msg_punch_ack(const std::string& node_id, const std::string& token_hex) {
+inline json msg_punch_ack(const std::string& node_id, const std::string& token_hex, int level) {
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
     json body;
     body["token"] = token_hex;
+    body["level"] = level;
     return make_envelope(MsgType::PUNCH_ACK, node_id, random_tx_id(), body);
 }
 

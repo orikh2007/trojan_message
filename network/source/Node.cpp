@@ -11,13 +11,16 @@ Node::Node(const uint16_t listen_port)
       ep_(udp::endpoint(asio::ip::make_address(ip_), port_)),
       is_root_(),
       root_ip_(),
+      root_ep_(),
       node_id_(),
       io_(),
       socket_(io_),
-      recv_(true),
+      recv_(true), daddy_(),
+      level_(-1),
       cur_connections_(0),
       clients_map_(),
-      clients_() {
+      clients_()
+{
     std::cout << "starting node init" << std::endl;
     std::error_code ec;
 
@@ -49,12 +52,13 @@ asio::io_context& Node::io() { return io_; } //get io context
 void Node::become_root() {
     is_root_ = true;
     setRoot(ip_);
+    level_ = 0;
 
     port_ = ROOT_PORT;
     const auto addr = asio::ip::make_address(ip_);
     ep_ = udp::endpoint(addr, port_);
 
-    peerInfo me;
+    PeerInfo me;
     me.peerId = node_id_;
     me.ep = ep_;
     me.last_seen = Clock::now();
@@ -175,15 +179,18 @@ void Node::handle_register() {
         return;
     }
     const udp::endpoint ep(addr, ROOT_PORT);
-    send_text(ep, data);
+
+    root_ep_ = ep;
+
+    send_text(root_ep_, data);
     std::cout << "Sent (async) to " << root_ip_ << ":" << ROOT_PORT << "\n";
 } //register with the root - send it node id and open port
 
-void Node::handle_register_ack(const std::string& tx, const peerInfo& curP, const int want) {
+void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) {
     const size_t size = clients_.size();
     int n = std::min(static_cast<int>(size)-1, 4);
     n = std::min(n, want);
-    std::vector<peerInfo> peers;
+    std::vector<PeerInfo> peers;
 
     std::random_device rd;
     std::mt19937 gen {rd()};
@@ -216,7 +223,7 @@ void Node::handle_register_ack(const std::string& tx, const peerInfo& curP, cons
                                                                                                   * sends registering client his peers and token,
                                                                                                   * and tells the peers to connect to the registering client
                                                                                                   */
-void Node::start_punch(const peerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
+void Node::start_punch(const PeerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
     std::cout << "Trying to punch: " << p.ep.address().to_string() << std::endl;
     auto& slot = connections_[p.peerId];
     slot = std::make_unique<Connection>(io_, p.ep, tkn);
@@ -236,7 +243,7 @@ void Node::punch(const std::string& peerId, const int timeout, const int punch_m
     auto& a = *it->second;
     if (a.connected) return;
 
-    const auto j = proto::msg_punch(node_id_, a.punch_token);
+    const auto j = proto::msg_punch(node_id_, a.punch_token, level_);
     send_text(a.ep, proto::dump_compact(j));
 
     a.tries++;
@@ -267,7 +274,7 @@ void Node::send_text(const udp::endpoint& target, std::string text) {
         target,
         [self = shared_from_this(), data, target](const std::error_code& ec, std::size_t bytes) {
             if (ec){
-                std::cerr << "send error: " << ec.message() << "\n";
+                std::cerr << "send error: " << ec.message() << " " << target.address().to_string() << " " << target.port() << ": " << proto::to_string(proto::parse_envelope(*data).type) << "\n";
             }
             else {
                 std::cout << "SEND to " << target.address().to_string() << ":" << target.port() << ": " << data.get() << std::endl;
@@ -312,7 +319,7 @@ void Node::process_receive(udp::endpoint& from, const std::string &msg) {
     try {
         const proto::Envelope env = proto::parse_envelope(msg);
         std::cout << "RECV from " << from.address().to_string() << ":" << from.port() << " | Type: " << proto::to_string(env.type) << std::endl;
-        process_msg(from, env);
+        dispatch(from, env);
     } catch (const std::exception& e) {
         std::cerr << "Bad message from "
                   << from.address().to_string() << ":" << from.port()
@@ -320,7 +327,7 @@ void Node::process_receive(udp::endpoint& from, const std::string &msg) {
     }
 } //processes receive - unwraps the envelope and sends it to process_msg
 
-void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
+void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
     std::cout << "processing message" << std::endl;
     switch (env.type) {
         case MsgType::REGISTER:
@@ -330,8 +337,7 @@ void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
             on_register_ack(from, env);
             break;
         case MsgType::KEEPALIVE:
-            std::cout << "received keep alive from: " << from.address().to_string() << std::endl;
-            connections_[env.src]->last_seen = Clock::now();
+            on_keepalive(from, env);
             break;
         case MsgType::PEER_LIST:
             break;
@@ -352,6 +358,12 @@ void Node::process_msg(udp::endpoint& from, const proto::Envelope& env) {
         case MsgType::DISCONNECT:
             on_disconnect(from, env);
             break;
+        case MsgType::LINK_UP:
+            on_linkup(from, env);
+            break;
+        case MsgType::LINK_DOWN:
+            on_linkdown(from, env);
+            break;
         default:
             std::cerr << "Message type cannot be processed: " << static_cast<int>(env.type) << std::endl;
     }
@@ -363,7 +375,7 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
         return;
     }
     try {
-        peerInfo p;
+        PeerInfo p;
         p.ep = from;
         p.last_seen = Clock::now();
         p.peerId = env.src;
@@ -391,12 +403,12 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
         json body = env.body;
 
         std::vector<json> jPeers = body["peers"];
-        std::vector<peerInfo> peers;
+        std::vector<PeerInfo> peers;
         for (auto& jp : jPeers) {
             std::error_code ec;
             auto peerAddr = asio::ip::make_address((jp.at("ip")).get<std::string>(), ec);
             if (!ec){
-                peerInfo p;
+                PeerInfo p;
                 auto peerPort = jp.at("port").get<uint16_t>();
                 auto peerEp   = udp::endpoint(peerAddr, peerPort);
                 p.ep = peerEp;
@@ -413,6 +425,8 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
         int timeout = env.body["timeout_ms"];
         int ka = env.body["ka_ms"];
         std::string tkn = env.body["token"];
+
+
 
         for (const auto& p : peers) {
             remember_token(p.peerId, p.tkn, 6000);
@@ -465,17 +479,18 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
 
     remember_token(peer_id, tkn);
 
-    peerInfo p(udp::endpoint(pAddr, pPort), peer_id, tkn);
+    PeerInfo p(udp::endpoint(pAddr, pPort), peer_id, tkn);
 
     std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
 
     start_punch(p, timeout, punch_ms, tkn);
 }
 
-void Node::mark_connected(std::string tkn, const std::string &node_id, udp::endpoint ep) {
+void Node::mark_connected(std::string tkn, const std::string &node_id, udp::endpoint ep, int level) {
     auto& cur = connections_[node_id];
     if (!cur) cur = std::make_unique<Connection>(io_, ep, tkn);
 
+    cur->level = level;
     cur->ep = ep;
     cur->punch_token = tkn;
     cur->connected = true;
@@ -522,9 +537,15 @@ void Node::on_punch(const udp::endpoint& from, const proto::Envelope& env) {
         return;
     }
 
-    auto ack = proto::msg_punch_ack(node_id_, tkn);
+    auto ack = proto::msg_punch_ack(node_id_, tkn, level_);
     send_text(from, proto::dump_compact(ack));
-    mark_connected(tkn, senderId, from);
+
+    cur_connections_++;
+
+    link_up(env.src);
+
+    mark_connected(tkn, senderId, from, env.body.at("level").get<uint16_t>());
+    choose_parent();
 }
 
 void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
@@ -537,14 +558,34 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
     if (it == connections_.end()) return;
     auto& a = *it->second;
 
-    if (a.punch_token != tkn) return; //mismatch/old attempt - ignore!
+    if (a.punch_token != tkn) return; // mismatch/old attempt - ignore!
 
     a.connected = true;
     a.timer.cancel();
 
+    a.level = body.at("level");
+
     cur_connections_++;
 
+    link_up(env.src);
+
     std::cout << "Success! connected to: " << senderId << " on " << from.address().to_string() << ":" << from.port() << ". Now connected to: " << cur_connections_ << std::endl;
+    choose_parent();
+}
+
+void Node::choose_parent() {
+    auto con = connections_.begin();
+    int minLevel = con->second->level;
+    NodeId minLevelId = con->first;
+    ++con;
+    for (; con != connections_.end(); ++con){
+        if (con->second->level < minLevel && con->second->level != -1) {
+            minLevel = con->second->level;
+            minLevelId = con->first;
+        }
+    }
+    daddy_ = minLevelId;
+    level_ = minLevel + 1;
 }
 
 void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
@@ -562,7 +603,52 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
 
 void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
     remove_connection(env.src);
+    link_down(env.src);
+}
 
+void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) {
+    if (!is_root_) return;
+    NodeId src = env.src;
+    NodeId neigh = env.body.at("peer").get<NodeId>();
+    clients_map_[src].neighbors.insert(neigh);
+    clients_map_[neigh].neighbors.insert(src);
+    std::cout << "[ROOT GRAPH] " << src << " <-> " << neigh
+          << " | deg(src)=" << clients_map_[src].neighbors.size()
+          << " deg(neigh)=" << clients_map_[neigh].neighbors.size()
+          << "\n";
+}
+
+void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) {
+    if (!is_root_) return;
+    NodeId src = env.src;
+    NodeId neigh = env.body.at("peer").get<NodeId>();
+    clients_map_[src].neighbors.erase(neigh);
+    clients_map_[neigh].neighbors.erase(src);
+}
+
+void Node::on_keepalive(const udp::endpoint& from, const proto::Envelope& env) {
+    auto it = connections_.find(env.src);
+    if (it != connections_.end() && it->second) {
+        it->second->last_seen = Clock::now();
+        std::cout << level_ << std::endl;
+    } else {
+        std::cerr << "KEEPALIVE from unknown/untracked " << env.src << "\n";
+    }
+}
+
+void Node::link_up(const NodeId& peer) {
+    prune_connections();
+    if (!is_root_) {
+        proto::json data = proto::msg_linkup(peer, node_id_);
+        auto msg = proto::dump_compact(data);
+        send_text(root_ep_, msg);
+    }
+}
+
+void Node::link_down(const NodeId& peer) {
+    proto::json data = proto::msg_linkdown(peer, node_id_);
+    auto msg = proto::dump_compact(data);
+    send_text(root_ep_, msg);
 }
 
 void Node::keep_alive(const std::string& peerId) {
@@ -591,10 +677,15 @@ void Node::keep_alive(const std::string& peerId) {
     });
 }
 
-void Node::disconnect() {
+void Node::prune_connections() {
+    if (cur_connections_ > MAX_CONNS) dynamic_disconnect();
+}
+
+void Node::dynamic_disconnect() {
+    // disconnecting from a random connection because the connection limit has been exceeded.
     auto conn = connections_.begin();
 
-    std::advance(conn, random_0_to_n(connections_.size()));
+    std::advance(conn, random_0_to_n(static_cast<int>(connections_.size())));
 
     udp::endpoint cur = conn->second->ep;
     std::string curId = conn->first;
@@ -608,5 +699,5 @@ void Node::disconnect() {
 void Node::remove_connection(const std::string& peerId) {
     connections_.erase(peerId);
     cur_connections_--;
-    std::cout << "Removed " << peerId << " As I got a new connections." << std::endl;
+    std::cout << "Removed " << peerId << " As I got a new connections or because I've been disconnected from." << std::endl;
 }
