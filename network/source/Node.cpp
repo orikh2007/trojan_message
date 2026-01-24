@@ -131,8 +131,18 @@ void Node::handle_command(const std::string& line) {
 
 } //handle the cli command - temporary
 
+void Node::handle_link(std::istringstream& iss) {
+    NodeId to_id;
+    try {
+        auto& p = *connections_.at(to_id);
+
+    } catch (std::exception e) {
+        std::cerr << "Linking up failed: " << e.what() << std::endl;
+    }
+}
+
 void Node::handle_send(std::istringstream& iss) {
-    std::string to_id;
+    NodeId to_id;
     int port_int = 0;
     iss >> to_id;
 
@@ -574,12 +584,13 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
 }
 
 void Node::choose_parent() {
+    if (connections_.empty()) return;
     auto con = connections_.begin();
     int minLevel = con->second->level;
     NodeId minLevelId = con->first;
     ++con;
     for (; con != connections_.end(); ++con){
-        if (con->second->level < minLevel && con->second->level != -1) {
+        if (con->second->level < minLevel && con->second->level != -1 && con->second->connected) {
             minLevel = con->second->level;
             minLevelId = con->first;
         }
@@ -683,6 +694,7 @@ void Node::prune_connections() {
 
 void Node::dynamic_disconnect() {
     // disconnecting from a random connection because the connection limit has been exceeded.
+    if (connections_.empty()) return;
     auto conn = connections_.begin();
 
     std::advance(conn, random_0_to_n(static_cast<int>(connections_.size())));
@@ -700,4 +712,189 @@ void Node::remove_connection(const std::string& peerId) {
     connections_.erase(peerId);
     cur_connections_--;
     std::cout << "Removed " << peerId << " As I got a new connections or because I've been disconnected from." << std::endl;
+}
+
+
+// ------------------------ routing logic ------------------------
+
+// ---------- helpers ----------
+
+static std::vector<NodeId> reconstruct_path(
+    const NodeId& src,
+    const NodeId& dst,
+    const std::unordered_map<NodeId, NodeId>& parent)
+{
+    std::vector<NodeId> path;
+    NodeId cur = dst;
+    path.push_back(cur);
+
+    while (cur != src) {
+        auto it = parent.find(cur);
+        if (it == parent.end()) return {}; // no path
+        cur = it->second;
+        path.push_back(cur);
+    }
+    std::reverse(path.begin(), path.end());
+    return path;
+}
+
+// BFS shortest path on the root's adjacency graph.
+// If forbidden contains a node, BFS will never step into it.
+// (Typically forbidden is "current route nodes", excluding endpoints.)
+std::optional<std::vector<NodeId>> Node::bfs_shortest_path(
+    const NodeId& src,
+    const NodeId& dst,
+    const std::unordered_set<NodeId>& forbidden) const
+{
+    if (!clients_map_.contains(src) || !clients_map_.contains(dst)) return std::nullopt;
+    if (src == dst) return std::vector<NodeId>{src};
+
+    std::queue<NodeId> q;
+    std::unordered_set<NodeId> vis;
+    std::unordered_map<NodeId, NodeId> parent;
+
+    auto allowed = [&](const NodeId& x) -> bool {
+        if (forbidden.contains(x)) return false;
+        return clients_map_.contains(x);
+    };
+
+    if (!allowed(src) || !allowed(dst)) return std::nullopt;
+
+    vis.insert(src);
+    q.push(src);
+
+    bool found = false;
+
+    while (!q.empty() && !found) {
+        NodeId u = q.front();
+        q.pop();
+
+        const auto& neighs = clients_map_.at(u).neighbors;
+        for (const auto& v : neighs) {
+            if (!allowed(v)) continue;
+            if (vis.contains(v)) continue;
+
+            vis.insert(v);
+            parent[v] = u;
+
+            if (v == dst) { found = true; break; }
+            q.push(v);
+        }
+    }
+
+    if (!found) return std::nullopt;
+
+    auto path = reconstruct_path(src, dst, parent);
+    if (path.empty()) return std::nullopt;
+    return path;
+}
+
+// Attempts to replace edge (u->v) in path with a longer detour u..v,
+// avoiding nodes already in `path` (except u and v).
+// Returns true if detour injected (path modified).
+bool Node::try_inject_detour(std::vector<NodeId>& path, size_t edge_i) const
+{
+    // edge_i refers to (path[edge_i], path[edge_i+1])
+    if (edge_i + 1 >= path.size()) return false;
+
+    const NodeId u = path[edge_i];
+    const NodeId v = path[edge_i + 1];
+
+    // Forbidden = all nodes in current path except u and v
+    std::unordered_set<NodeId> forbidden;
+    forbidden.reserve(path.size());
+    for (const auto& n : path) forbidden.insert(n);
+    forbidden.erase(u);
+    forbidden.erase(v);
+
+    auto detour_opt = bfs_shortest_path(u, v, forbidden);
+    if (!detour_opt) return false;
+
+    const auto& detour = *detour_opt;
+
+    // detour must be longer than direct edge (length >= 3 nodes => >=2 edges)
+    if (detour.size() < 3) return false;
+
+    // Splice: replace [u, v] with [u, x, ..., v]
+    // path = prefix(0..edge_i) + detour(1..end-2) + suffix(edge_i+1..end)
+    std::vector<NodeId> out;
+    out.reserve(path.size() + detour.size());
+
+    // prefix includes u
+    out.insert(out.end(), path.begin(), path.begin() + static_cast<long long>(edge_i) + 1);
+
+    // middle: detour without endpoints
+    out.insert(out.end(), detour.begin() + 1, detour.end() - 1);
+
+    // suffix starts at v
+    out.insert(out.end(), path.begin() + static_cast<long long>(edge_i) + 1, path.end());
+
+    path.swap(out);
+    return true;
+}
+
+// ---------- main API ----------
+
+// Root-side route computation:
+// 1) shortest path BFS
+// 2) if hops < min_hops, inject detours to stretch while keeping it simple
+std::optional<std::vector<NodeId>> Node::compute_route(
+    const NodeId& src,
+    const NodeId& dst,
+    int min_hops) const
+{
+    if (!is_root_) return std::nullopt;
+    if (min_hops < 0) min_hops = 0;
+
+    // Step A: shortest path with no restrictions
+    std::unordered_set<NodeId> none;
+    auto base_opt = bfs_shortest_path(src, dst, none);
+    if (!base_opt) return std::nullopt;
+
+    std::vector<NodeId> path = *base_opt;
+
+    auto hops = [&]() -> int {
+        if (path.size() < 2) return 0;
+        return static_cast<int>(path.size() - 1);
+    };
+
+    if (hops() >= min_hops) return path;
+
+    // Step B: stretch by detour injection
+    // We need randomness to avoid always trying the same edge.
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
+    // Safety: you can't have a simple path longer than N-1 edges.
+    // This isn't a "max hops" feature—it's a graph reality constraint.
+    const int N = static_cast<int>(clients_map_.size());
+    const int max_possible_simple_hops = std::max(0, N - 1);
+    if (min_hops > max_possible_simple_hops) {
+        // impossible without repeats
+        return std::nullopt;
+    }
+
+    // Keep trying to inject detours until we reach min_hops
+    // Bound the work so we don't loop forever on hard graphs.
+    int attempts = 0;
+
+    while (hops() < min_hops && attempts < attempt_budget) {
+        attempts++;
+
+        if (path.size() < 2) break;
+
+        // pick a random edge index in [0, path.size()-2]
+        std::uniform_int_distribution<int> dist(0, static_cast<int>(path.size() - 2));
+        size_t edge_i = static_cast<size_t>(dist(rng));
+
+        // try to inject; if fails, loop and try another edge
+        (void)try_inject_detour(path, edge_i);
+    }
+
+    if (hops() < min_hops) {
+        // Graph too small / constrained to reach min hops without repeats
+        return std::nullopt;
+    }
+
+    return path;
 }

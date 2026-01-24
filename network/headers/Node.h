@@ -7,7 +7,9 @@
 #include "msg.h"
 #include "networkSettings.h"
 #include "apiComm.h"
+#include <queue>
 
+#define attempt_budget 200
 
 constexpr int MAX_CONNS = 4;
 constexpr int ROOT_PORT = 12345;
@@ -62,6 +64,7 @@ public:
 
     void handle_command(const std::string& line);
 
+    void handle_link(std::istringstream &iss);
 
 private:
     void send_text(const udp::endpoint &target, std::string text);
@@ -126,6 +129,21 @@ private:
     void dynamic_disconnect();
 
     void remove_connection(const std::string &peerId);
+
+// ------------------------ routing logic ------------------------
+
+    std::optional<std::vector<NodeId>> bfs_shortest_path(
+    const NodeId& src,
+    const NodeId& dst,
+    const std::unordered_set<NodeId>& forbidden) const;
+
+    bool try_inject_detour(std::vector<NodeId>& path, size_t edge_i) const;
+
+    std::optional<std::vector<NodeId>> compute_route(
+        const NodeId& src,
+        const NodeId& dst,
+        int min_hops) const;
+
 
     std::string ip_;
     uint16_t port_;

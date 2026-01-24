@@ -20,14 +20,14 @@ typedef std::string NodeId;
 using Clock = std::chrono::steady_clock;
 
 struct PeerInfo {
-    int level;
+    int level{};
     udp::endpoint ep;
     Clock::time_point last_seen;
     std::string peerId;
     std::string tkn;
     std::unordered_set<NodeId> neighbors;
     PeerInfo() = default;
-    PeerInfo(udp::endpoint endp, std::string p_id, std::string tok) : level(0),
+    PeerInfo(udp::endpoint endp, std::string p_id, std::string tok) : level(-1),
         ep(std::move(endp)),
         last_seen(Clock::now()), peerId(std::move(p_id)), tkn(std::move(tok)){
     }
@@ -57,7 +57,9 @@ enum class MsgType {
     DISCONNECT,
     HOP,
     LINK_UP,
-    LINK_DOWN
+    LINK_DOWN,
+    ROUTE_REQ,
+    ROUTE_RESP
 };
 
 struct HopMessage {
@@ -67,13 +69,6 @@ struct HopMessage {
     std::string nxt;
     uint16_t ttl;
     std::string payload;
-
-};
-
-struct Message {
-    MsgType type;
-    std::string src;
-    std::string dst;
 
 };
 
@@ -93,6 +88,8 @@ inline std::string to_string(const MsgType t) {
         case MsgType::HOP:              return "HOP";
         case MsgType::LINK_UP:          return "LINK_UP";
         case MsgType::LINK_DOWN:        return "LINK_DOWN";
+        case MsgType::ROUTE_REQ:        return "ROUTE_REQ";
+        case MsgType::ROUTE_RESP:        return "ROUTE_RESP";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -113,6 +110,8 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "HOP") return MsgType::HOP;
     if (s == "LINK_UP") return MsgType::LINK_UP;
     if (s == "LINK_DOWN") return MsgType::LINK_DOWN;
+    if (s == "ROUTE_REQ") return MsgType::ROUTE_REQ;
+    if (s == "ROUTE_RESP") return MsgType::ROUTE_RESP;
     return std::nullopt;
 }
 
@@ -299,7 +298,13 @@ inline std::string dump_compact(const json& j) {
 // Message builders
 // ---------------------------
 
-inline json msg_register(const std::string& node_id, uint16_t listen_port, int want_peers = 4) {
+inline json msg_hop(std::string payload, const NodeId &src) {
+    json body;
+    body["payload"] = payload;
+    return make_envelope(MsgType::HOP, src, random_tx_id(), body);
+}
+
+inline json msg_register(const NodeId& node_id, uint16_t listen_port, int want_peers = 4) {
     json body;
     body["listen_port"] = listen_port;
     body["want_peers"] = want_peers;
