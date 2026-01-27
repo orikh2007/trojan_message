@@ -23,7 +23,7 @@ struct PeerInfo {
     int level{};
     udp::endpoint ep;
     Clock::time_point last_seen;
-    std::string peerId;
+    NodeId peerId;
     std::string tkn;
     std::unordered_set<NodeId> neighbors;
     PeerInfo() = default;
@@ -341,7 +341,12 @@ inline json msg_register_ack(const std::string& tx,
     return make_envelope(MsgType::REGISTER_ACK, "ROOT", tx, body);
 }
 
-inline json msg_keepalive(const std::string& node_id) {
+inline json msg_disconnect(const NodeId& node_id) {
+    json body = json::object();
+    return make_envelope(MsgType::DISCONNECT, node_id, random_tx_id(), body);
+}
+
+inline json msg_keepalive(const NodeId& node_id) {
     json body = json::object();
     return make_envelope(MsgType::KEEPALIVE, node_id, random_tx_id(), body);
 }
@@ -424,12 +429,6 @@ inline json msg_error(const std::string& tx, std::string code, std::string detai
     body["detail"] = std::move(detail);
     return make_envelope(MsgType::ERROR_, "ROOT", tx, body);
 }
-
-inline json msg_disconnect(const std::string& node_id) {
-    const json body;
-    return make_envelope(MsgType::DISCONNECT, node_id, random_tx_id(), body);
-}
-
 // ---------------------------
 // Typed extractors (safe reads)
 // ---------------------------

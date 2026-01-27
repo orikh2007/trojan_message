@@ -10,6 +10,8 @@
 #include <queue>
 
 #define attempt_budget 200
+#define expiration_time_sec std::chrono::seconds(45)
+#define prune_sec std::chrono::seconds(10)
 
 constexpr int MAX_CONNS = 4;
 constexpr int ROOT_PORT = 12345;
@@ -29,7 +31,7 @@ struct Connection {
     asio::steady_timer ka_timer;
 
     Connection(asio::io_context& io, udp::endpoint endP, std::string tkn)
-        : ep(std::move(endP)), punch_token(std::move(tkn)), timer(io), ka_timer(io), level(0) {}
+        : level(-1), ep(std::move(endP)), punch_token(std::move(tkn)), timer(io), ka_timer(io) {}
 };
 
 struct TokenEntry {
@@ -55,6 +57,8 @@ public:
     void start();
 
     asio::io_context& io();
+
+    void start_pruner();
 
     void become_root();
 
@@ -105,8 +109,12 @@ private:
 
     void handle_register();
 
+    void handle_dis();
+
     void handle_register_ack(const std::string& tx,
-        const PeerInfo& curP, const int want);
+                             const PeerInfo& curP, const int want);
+
+    void broadcast(const std::string &msg);
 
     void start_punch(const PeerInfo &p, int timeout, int punch_ms, const std::string &tkn);
 
@@ -124,9 +132,17 @@ private:
 
     void keep_alive(const std::string &peerId);
 
+    void prune_tick();
+
     void prune_connections();
 
-    void dynamic_disconnect();
+    void prune_dead();
+
+    void print_graph();
+
+    void rand_disconnect();
+
+    void dynamic_disconnect(NodeId id);
 
     void remove_connection(const std::string &peerId);
 
@@ -145,6 +161,8 @@ private:
         int min_hops) const;
 
 
+
+// -------------------------- Attributes --------------------------
     std::string ip_;
     uint16_t port_;
     udp::endpoint ep_;
@@ -152,7 +170,7 @@ private:
     bool is_root_ = false;
     std::string root_ip_;
     udp::endpoint root_ep_;
-    std::string node_id_;
+    NodeId node_id_;
     asio::io_context io_;
     udp::socket socket_;
     udp::endpoint remote_;
@@ -164,6 +182,12 @@ private:
     int level_;
 
     int cur_connections_;
+
+    asio::steady_timer prune_timer_;
+
+    std::unordered_set<NodeId> linked_up_;
+
+    std::string gateway_;
 
     std::map<std::string, PeerInfo> clients_map_;
     std::vector<std::string> clients_;

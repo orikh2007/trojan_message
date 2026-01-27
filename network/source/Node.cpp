@@ -4,6 +4,9 @@
 
 #include "../headers/Node.h"
 
+void erase_client_id(std::vector<NodeId>& v, const NodeId& id) {
+    v.erase(std::remove(v.begin(), v.end(), id), v.end());
+}
 
 Node::Node(const uint16_t listen_port)
     : ip_(getIP(v4)),
@@ -18,9 +21,9 @@ Node::Node(const uint16_t listen_port)
       recv_(true), daddy_(),
       level_(-1),
       cur_connections_(0),
+      prune_timer_(io_),
       clients_map_(),
-      clients_()
-{
+      clients_() {
     std::cout << "starting node init" << std::endl;
     std::error_code ec;
 
@@ -45,9 +48,15 @@ Node::Node(const uint16_t listen_port)
 void Node::start() {
     recv_ = true;
     start_receive();
+    std::cout << "starting pruner" << std::endl;
+    start_pruner();
 } //start the receiving io "loop"
 
 asio::io_context& Node::io() { return io_; } //get io context
+
+void Node::start_pruner() {
+    prune_tick();
+}
 
 void Node::become_root() {
     is_root_ = true;
@@ -86,10 +95,13 @@ void Node::rebind() {
 
         std::cout << "Rebound to UDP port " << self->port_ << "\n";
 
+        self->prune_timer_.cancel(ec);
         // 4) re-arm receive
         self->start_receive();
     });
 }
+
+
 
 const std::string& Node::id() {return node_id_;} //get node id
 
@@ -114,8 +126,10 @@ void Node::handle_command(const std::string& line) {
             handle_register();
         } else if (cmd == "root") {
             become_root();
+        } else if (cmd == "graph"){
+            print_graph();
         } else if (cmd == "dis") {
-
+            handle_dis();
         } else {
             std::cout   << "Commands:\n"
                         << "  send <ip> <port> <message>\n"
@@ -136,7 +150,7 @@ void Node::handle_link(std::istringstream& iss) {
     try {
         auto& p = *connections_.at(to_id);
 
-    } catch (std::exception e) {
+    } catch (std::exception& e) {
         std::cerr << "Linking up failed: " << e.what() << std::endl;
     }
 }
@@ -196,6 +210,15 @@ void Node::handle_register() {
     std::cout << "Sent (async) to " << root_ip_ << ":" << ROOT_PORT << "\n";
 } //register with the root - send it node id and open port
 
+void Node::handle_dis() {
+    auto msg = proto::msg_disconnect(node_id_);
+    auto data = proto::dump_compact(msg);
+    broadcast(data);
+    for (auto& it : connections_) {
+        link_down(it.first);
+    }
+}
+
 void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) {
     const size_t size = clients_.size();
     int n = std::min(static_cast<int>(size)-1, 4);
@@ -233,6 +256,14 @@ void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, cons
                                                                                                   * sends registering client his peers and token,
                                                                                                   * and tells the peers to connect to the registering client
                                                                                                   */
+
+void Node::broadcast(const std::string& msg) {
+    for (auto it = connections_.begin(); it != connections_.end(); ++it) {
+        auto curEp = it->second->ep;
+        send_text(curEp, msg);
+    }
+}
+
 void Node::start_punch(const PeerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
     std::cout << "Trying to punch: " << p.ep.address().to_string() << std::endl;
     auto& slot = connections_[p.peerId];
@@ -389,10 +420,11 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
         p.ep = from;
         p.last_seen = Clock::now();
         p.peerId = env.src;
+        std::cout << "K: " << env.src << " T: " << p.peerId << std::endl;
         clients_map_[env.src] = p;
         clients_.push_back(p.peerId);
 
-        int want = env.body["want_peers"];
+        int want = env.body.at("want_peers").get<int>();
 
         std::string tx = env.tx;
 
@@ -479,7 +511,6 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     const std::string tkn = body.at("token").get<std::string>();
 
 
-
     std::error_code ec;
     auto pAddr = asio::ip::make_address(pIp, ec);
     if (ec) {
@@ -550,7 +581,6 @@ void Node::on_punch(const udp::endpoint& from, const proto::Envelope& env) {
     auto ack = proto::msg_punch_ack(node_id_, tkn, level_);
     send_text(from, proto::dump_compact(ack));
 
-    cur_connections_++;
 
     link_up(env.src);
 
@@ -575,7 +605,6 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
 
     a.level = body.at("level");
 
-    cur_connections_++;
 
     link_up(env.src);
 
@@ -597,6 +626,7 @@ void Node::choose_parent() {
     }
     daddy_ = minLevelId;
     level_ = minLevel + 1;
+    std::cout << "DADDY: " << daddy_ << " LEVEL: " << level_ << std::endl;
 }
 
 void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
@@ -612,7 +642,7 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
     std::cout << "Got DATA from: " << env.src << " saying: " << msg << std::endl;
 }
 
-void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
+void Node:: on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
     remove_connection(env.src);
     link_down(env.src);
 }
@@ -633,8 +663,17 @@ void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) {
     if (!is_root_) return;
     NodeId src = env.src;
     NodeId neigh = env.body.at("peer").get<NodeId>();
-    clients_map_[src].neighbors.erase(neigh);
-    clients_map_[neigh].neighbors.erase(src);
+    auto src_it = clients_map_.find(src);
+    auto neigh_it = clients_map_.find(neigh);
+    if (neigh_it != clients_map_.end()) clients_map_[neigh].neighbors.erase(src);
+    if (src_it != clients_map_.end()) clients_map_[src].neighbors.erase(neigh);
+    if (clients_map_[neigh].neighbors.size() == 0 && neigh != node_id_) {
+        clients_map_.erase(neigh);
+        erase_client_id(clients_, neigh);
+    }if (clients_map_[src].neighbors.size() == 0 && src != node_id_) {
+        clients_map_.erase(src);
+        erase_client_id(clients_, src);
+    }
 }
 
 void Node::on_keepalive(const udp::endpoint& from, const proto::Envelope& env) {
@@ -648,7 +687,10 @@ void Node::on_keepalive(const udp::endpoint& from, const proto::Envelope& env) {
 }
 
 void Node::link_up(const NodeId& peer) {
+    if (linked_up_.contains(peer)) return;
     prune_connections();
+    linked_up_.insert(peer);
+    cur_connections_++;
     if (!is_root_) {
         proto::json data = proto::msg_linkup(peer, node_id_);
         auto msg = proto::dump_compact(data);
@@ -657,12 +699,15 @@ void Node::link_up(const NodeId& peer) {
 }
 
 void Node::link_down(const NodeId& peer) {
-    proto::json data = proto::msg_linkdown(peer, node_id_);
-    auto msg = proto::dump_compact(data);
-    send_text(root_ep_, msg);
+    if (!is_root_) {
+        proto::json data = proto::msg_linkdown(peer, node_id_);
+        auto msg = proto::dump_compact(data);
+        send_text(root_ep_, msg);
+    }
 }
 
 void Node::keep_alive(const std::string& peerId) {
+    prune_dead();
     auto it = connections_.find(peerId);
     if (it == connections_.end() || !it->second) {
         std::cerr << "tried to keep_alive with a non-existing connection" << std::endl;
@@ -680,6 +725,7 @@ void Node::keep_alive(const std::string& peerId) {
 
     conn.ka_timer.expires_after(std::chrono::milliseconds(conn.ka_ms));
     conn.ka_timer.async_wait([self = shared_from_this(), peerId](const std::error_code ec) {
+        if (ec == asio::error::operation_aborted) return;
         if (ec) {
             std::cerr << "ka_timer async wait failed: " << ec.message() << std::endl;
             return;
@@ -688,29 +734,110 @@ void Node::keep_alive(const std::string& peerId) {
     });
 }
 
-void Node::prune_connections() {
-    if (cur_connections_ > MAX_CONNS) dynamic_disconnect();
+void Node::prune_tick() {
+    prune_timer_.expires_after(prune_sec);
+    prune_timer_.async_wait([self = shared_from_this()](const std::error_code& ec) {
+        if (ec == asio::error::operation_aborted) return; // canceled on shutdown/rebind
+        if (ec) {
+            std::cerr << "prune_timer error: " << ec.message() << "\n";
+            return;
+        }
+
+        // Do the pruning work
+        self->prune_tokens();            // you already have this
+        self->prune_dead();  // implement as we discussed
+
+        // reschedule
+        self->prune_tick();
+    });
 }
 
-void Node::dynamic_disconnect() {
+void Node::prune_dead() {
+    std::vector<NodeId> dead;
+    for (const auto& [id, conn] : connections_) {
+        if (Clock::now() - conn->last_seen > expiration_time_sec) {
+            dead.push_back(id);
+        }
+    }
+    for (const auto& id : dead) {
+        std::cout << id << " is dead :(\n";
+        dynamic_disconnect(id);
+    }
+}
+
+void Node::print_graph() {
+    if (!is_root_) {
+        std::cout << "[ROOT GRAPH] not root\n";
+        return;
+    }
+
+    std::cout << "\n========== ROOT GRAPH ==========\n";
+    std::cout << "nodes: " << clients_map_.size() << "\n";
+
+    // Per-node summary
+    for (const auto& [id, p] : clients_map_) {
+        std::cout << " - " << id
+                  << " deg=" << p.neighbors.size()
+                  << " ep=" << p.ep.address().to_string() << ":" << p.ep.port()
+                  << "\n";
+    }
+
+    // Print edges once (u < v)
+    std::cout << "\nedges:\n";
+    size_t edges = 0;
+    for (const auto& [u, pu] : clients_map_) {
+        for (const auto& v : pu.neighbors) {
+            if (u < v) { // print each undirected edge only once
+                std::cout << "  " << u << " <-> " << v << "\n";
+                ++edges;
+            }
+        }
+    }
+    std::cout << "edge_count=" << edges << "\n";
+    std::cout << "================================\n\n";
+}
+
+void Node::prune_connections() {
+    if (cur_connections_ > MAX_CONNS) rand_disconnect();
+}
+
+
+void Node::rand_disconnect() {
     // disconnecting from a random connection because the connection limit has been exceeded.
     if (connections_.empty()) return;
     auto conn = connections_.begin();
-
     std::advance(conn, random_0_to_n(static_cast<int>(connections_.size())));
+    NodeId curId = conn->first;
 
-    udp::endpoint cur = conn->second->ep;
-    std::string curId = conn->first;
-
-    json msg = proto::msg_disconnect(node_id_);
-    std::string data = proto::dump_compact(msg);
-    send_text(cur, proto::dump_compact(data));
-    remove_connection(curId);
+    dynamic_disconnect(curId);
 }
 
-void Node::remove_connection(const std::string& peerId) {
-    connections_.erase(peerId);
-    cur_connections_--;
+void Node::dynamic_disconnect(NodeId id) {
+    auto it = connections_.find(id);
+    if (it == connections_.end()) return;
+
+    udp::endpoint cur = it->second->ep;
+    json msg = proto::msg_disconnect(node_id_);
+    send_text(cur, proto::dump_compact(msg));
+    remove_connection(id);
+}
+
+void Node::remove_connection(const NodeId& peerId) {
+    auto it = connections_.find(peerId);
+    if (it == connections_.end() || !it->second) return;
+
+    // cancel timers first (handlers will get operation_aborted)
+    std::error_code ec;
+    it->second->timer.cancel(ec);
+    it->second->ka_timer.cancel(ec);
+
+    connections_.erase(it);
+
+    linked_up_.erase(peerId);
+    if (cur_connections_ > 0) cur_connections_--;
+
+    link_down(peerId);
+
     std::cout << "Removed " << peerId << " As I got a new connections or because I've been disconnected from." << std::endl;
 }
 
