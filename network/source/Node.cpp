@@ -626,7 +626,7 @@ void Node::choose_parent() {
     }
     daddy_ = minLevelId;
     level_ = minLevel + 1;
-    std::cout << "DADDY: " << daddy_ << " LEVEL: " << level_ << std::endl;
+    std::cout << "DADDY: " << daddy_ << " MIN LEVEL: " << minLevel << std::endl;
 }
 
 void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
@@ -642,7 +642,7 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
     std::cout << "Got DATA from: " << env.src << " saying: " << msg << std::endl;
 }
 
-void Node:: on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
+void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
     remove_connection(env.src);
     link_down(env.src);
 }
@@ -667,10 +667,10 @@ void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) {
     auto neigh_it = clients_map_.find(neigh);
     if (neigh_it != clients_map_.end()) clients_map_[neigh].neighbors.erase(src);
     if (src_it != clients_map_.end()) clients_map_[src].neighbors.erase(neigh);
-    if (clients_map_[neigh].neighbors.size() == 0 && neigh != node_id_) {
+    if (clients_map_[neigh].neighbors.empty() && neigh != node_id_) {
         clients_map_.erase(neigh);
         erase_client_id(clients_, neigh);
-    }if (clients_map_[src].neighbors.size() == 0 && src != node_id_) {
+    }if (clients_map_[src].neighbors.empty() && src != node_id_) {
         clients_map_.erase(src);
         erase_client_id(clients_, src);
     }
@@ -812,7 +812,7 @@ void Node::rand_disconnect() {
     dynamic_disconnect(curId);
 }
 
-void Node::dynamic_disconnect(NodeId id) {
+void Node::dynamic_disconnect(const NodeId& id) {
     auto it = connections_.find(id);
     if (it == connections_.end()) return;
 

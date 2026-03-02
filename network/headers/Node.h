@@ -142,7 +142,7 @@ private:
 
     void rand_disconnect();
 
-    void dynamic_disconnect(NodeId id);
+    void dynamic_disconnect(const NodeId& id);
 
     void remove_connection(const std::string &peerId);
 
