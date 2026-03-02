@@ -210,6 +210,10 @@ void Node::handle_register() {
     std::cout << "Sent (async) to " << root_ip_ << ":" << ROOT_PORT << "\n";
 } //register with the root - send it node id and open port
 
+void Node::request_conns() {
+
+}
+
 void Node::handle_dis() {
     auto msg = proto::msg_disconnect(node_id_);
     auto data = proto::dump_compact(msg);
@@ -405,6 +409,9 @@ void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
         case MsgType::LINK_DOWN:
             on_linkdown(from, env);
             break;
+        case MsgType::REQ_CONNS:
+            on_req_conns(from, env);
+            break;
         default:
             std::cerr << "Message type cannot be processed: " << static_cast<int>(env.type) << std::endl;
     }
@@ -436,6 +443,10 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
         std::cerr << "Bad register message from " << from.address().to_string() << ": " << e.what();
     }
 } //for root - processes registration requests.
+
+void Node::on_req_conns(const udp::endpoint& from, const proto::Envelope& env) {
+
+}
 
 void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env) {
     try {
@@ -613,6 +624,7 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
 }
 
 void Node::choose_parent() {
+    if (is_root_) return;
     if (connections_.empty()) return;
     auto con = connections_.begin();
     int minLevel = con->second->level;
@@ -798,7 +810,7 @@ void Node::print_graph() {
 }
 
 void Node::prune_connections() {
-    if (cur_connections_ > MAX_CONNS) rand_disconnect();
+    if (cur_connections_ >= MAX_CONNS) rand_disconnect();
 }
 
 
@@ -835,6 +847,7 @@ void Node::remove_connection(const NodeId& peerId) {
 
     linked_up_.erase(peerId);
     if (cur_connections_ > 0) cur_connections_--;
+    else request_conns();
 
     link_down(peerId);
 

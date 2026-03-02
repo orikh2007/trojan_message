@@ -59,7 +59,8 @@ enum class MsgType {
     LINK_UP,
     LINK_DOWN,
     ROUTE_REQ,
-    ROUTE_RESP
+    ROUTE_RESP,
+    REQ_CONNS
 };
 
 struct HopMessage {
@@ -90,6 +91,7 @@ inline std::string to_string(const MsgType t) {
         case MsgType::LINK_DOWN:        return "LINK_DOWN";
         case MsgType::ROUTE_REQ:        return "ROUTE_REQ";
         case MsgType::ROUTE_RESP:        return "ROUTE_RESP";
+        case MsgType::REQ_CONNS:        return "REQ_CONNS";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -112,6 +114,7 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "LINK_DOWN") return MsgType::LINK_DOWN;
     if (s == "ROUTE_REQ") return MsgType::ROUTE_REQ;
     if (s == "ROUTE_RESP") return MsgType::ROUTE_RESP;
+    if (s == "REQ_CONNS") return MsgType::REQ_CONNS;
     return std::nullopt;
 }
 
@@ -302,6 +305,13 @@ inline json msg_hop(std::string payload, const NodeId &src) {
     json body;
     body["payload"] = payload;
     return make_envelope(MsgType::HOP, src, random_tx_id(), body);
+}
+
+inline json msg_req_conns(const NodeId& node_id, uint16_t listen_port, int want_peers = 4) {
+    json body;
+    body["listen_port"] = listen_port;
+    body["want_peers"] = want_peers;
+    return make_envelope(MsgType::REQ_CONNS, node_id, random_tx_id(), body);
 }
 
 inline json msg_register(const NodeId& node_id, uint16_t listen_port, int want_peers = 4) {
