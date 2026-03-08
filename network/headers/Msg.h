@@ -60,7 +60,8 @@ enum class MsgType {
     LINK_DOWN,
     ROUTE_REQ,
     ROUTE_RESP,
-    REQ_CONNS
+    REQ_CONNS,
+    REQ_CONNS_ACK
 };
 
 struct HopMessage {
@@ -92,6 +93,7 @@ inline std::string to_string(const MsgType t) {
         case MsgType::ROUTE_REQ:        return "ROUTE_REQ";
         case MsgType::ROUTE_RESP:        return "ROUTE_RESP";
         case MsgType::REQ_CONNS:        return "REQ_CONNS";
+        case MsgType::REQ_CONNS_ACK:    return "REQ_CONNS_ACK";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -115,6 +117,7 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "ROUTE_REQ") return MsgType::ROUTE_REQ;
     if (s == "ROUTE_RESP") return MsgType::ROUTE_RESP;
     if (s == "REQ_CONNS") return MsgType::REQ_CONNS;
+    if (s == "REQ_CONNS_ACK") return MsgType::REQ_CONNS_ACK;
     return std::nullopt;
 }
 
@@ -312,6 +315,36 @@ inline json msg_req_conns(const NodeId& node_id, uint16_t listen_port, int want_
     body["listen_port"] = listen_port;
     body["want_peers"] = want_peers;
     return make_envelope(MsgType::REQ_CONNS, node_id, random_tx_id(), body);
+}
+
+inline json msg_req_conns_ack(const std::string& tx,
+                             const udp::endpoint &you,
+                             const std::vector<PeerInfo>& peers,
+                             const std::string& token_hex,
+                             int ka_ms = 15000, int punch_ms = 100, int timeout_ms = 4000) {
+    require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
+    json body;
+    std::string you_ip = you.address().to_string();
+    uint16_t you_port = you.port();
+    std::vector<json> peersJ;
+    for (auto peer : peers) {
+        json peerJ;
+        peerJ["id"] = peer.peerId;
+        peerJ["ip"] = peer.ep.address().to_string();
+        peerJ["port"] = peer.ep.port();
+        peerJ["token"] = peer.tkn;
+        peerJ["level"] = peer.level;
+        peersJ.push_back(peerJ);
+    }
+
+    body["you"] = {{"ip", you_ip}, {"port", you_port}};
+    body["peers"] = peersJ; // each peer: {"id","ip","port"}
+    body["ka_ms"] = ka_ms;
+    body["token"] = token_hex;
+    body["punch_ms"] = punch_ms;
+    body["timeout_ms"] = timeout_ms;
+
+    return make_envelope(MsgType::REQ_CONNS_ACK, "ROOT", tx, body);
 }
 
 inline json msg_register(const NodeId& node_id, uint16_t listen_port, int want_peers = 4) {

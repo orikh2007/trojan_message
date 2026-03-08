@@ -120,15 +120,15 @@ void Node::handle_command(const std::string& line) {
         std::string cmd;
         iss >> cmd;
 
-        if (cmd == "send") {
+        if (cmd == "send" || cmd == "s") {
             handle_send(iss);
-        } else if (cmd == "register") {
+        } else if (cmd == "register" || cmd == "r") {
             handle_register();
-        } else if (cmd == "root") {
+        } else if (cmd == "root" ) {
             become_root();
-        } else if (cmd == "graph"){
+        } else if (cmd == "graph" || cmd == "g"){
             print_graph();
-        } else if (cmd == "dis") {
+        } else if (cmd == "dis" || cmd == "d") {
             handle_dis();
         } else {
             std::cout   << "Commands:\n"
@@ -211,7 +211,11 @@ void Node::handle_register() {
 } //register with the root - send it node id and open port
 
 void Node::request_conns() {
-
+    auto j = proto::msg_req_conns(node_id_, port_);
+    const auto data = proto::dump_compact(j);
+    std::error_code ec;
+    send_text(root_ep_, data);
+    std::cout << "Sent root req_conns";
 }
 
 void Node::handle_dis() {
@@ -223,7 +227,7 @@ void Node::handle_dis() {
     }
 }
 
-void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) {
+void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) { //root function
     const size_t size = clients_.size();
     int n = std::min(static_cast<int>(size)-1, 4);
     n = std::min(n, want);
@@ -260,6 +264,13 @@ void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, cons
                                                                                                   * sends registering client his peers and token,
                                                                                                   * and tells the peers to connect to the registering client
                                                                                                   */
+
+void Node::send_up(const proto::Envelope env) {
+    auto& conn = connections_.at(daddy_);
+    auto ep = conn->ep;
+    auto j = proto::make_envelope(env.type, env.src, env.tx, env.body);
+    send_text(ep, proto::dump_compact(j));
+}
 
 void Node::broadcast(const std::string& msg) {
     for (auto it = connections_.begin(); it != connections_.end(); ++it) {
@@ -412,12 +423,15 @@ void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
         case MsgType::REQ_CONNS:
             on_req_conns(from, env);
             break;
+        case MsgType::REQ_CONNS_ACK:
+            on_req_conns_ack(from, env);
+            break;
         default:
             std::cerr << "Message type cannot be processed: " << static_cast<int>(env.type) << std::endl;
     }
 } //dispatches funcs according to message type
 
-void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
+void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) { //root function
     if (!is_root_) {
         std::cerr << "I'M GROOT (NOT ROOT, DONT REGISTER HERE!)";
         return;
@@ -445,7 +459,46 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) {
 } //for root - processes registration requests.
 
 void Node::on_req_conns(const udp::endpoint& from, const proto::Envelope& env) {
+    if (!is_root_) return;
+    int want = env.body.at("want_peers").get<int>();
+    auto tx = env.tx;
 
+    auto cur = clients_map_.find(env.src);
+    if (cur == clients_map_.end()) on_register(from, env);
+    const PeerInfo& curP = cur->second;
+
+    const size_t size = clients_.size();
+    int n = std::min(static_cast<int>(size)-1, MAX_CONNS);
+    n = std::min(n, want);
+    std::vector<PeerInfo> peers;
+
+    std::random_device rd;
+    std::mt19937 gen {rd()};
+    std::ranges::shuffle(clients_, gen);
+
+    for (size_t i = 0; i < clients_.size() && peers.size() < static_cast<size_t>(n); ++i) {
+        const std::string& cli = clients_[i];
+        if (cli == curP.peerId) continue;
+        if (clients_map_.at(curP.peerId).neighbors.contains(cli)) continue;
+        clients_map_.at(cli).tkn = proto::random_token_hex();
+        peers.push_back(clients_map_.at(cli));
+    }
+
+    const std::string token = proto::random_token_hex();
+
+    const json jNew = proto::msg_req_conns_ack(tx, curP.ep, peers, token); //reg_ack JSON for newcomer
+    const udp::endpoint registeringCli = curP.ep;
+    const auto dataNew = proto::dump_compact(jNew); //reg_ack data for newcomer
+    send_text(registeringCli, dataNew);
+    std::cout << "Sent req_conn_ack to " << registeringCli.address().to_string() << ":" << registeringCli.port() << std::endl;
+
+    for (auto membr : peers){
+        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
+        auto epMembr = membr.ep;
+        const auto dataMembr = proto::dump_compact(jMembr);
+        send_text(epMembr, dataMembr);
+        std::cout << "Sent introduce msg to " << epMembr.address().to_string() << ":" << epMembr.port() << std::endl;
+    }
 }
 
 void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env) {
@@ -488,6 +541,49 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
         }
     } catch (const std::exception& e) {
         std::cerr << "Exception while registering register_ack: " << e.what() << std::endl;
+    }
+}
+
+void Node::on_req_conns_ack(const udp::endpoint& from, const proto::Envelope& env) {
+    try {
+        if (env.src != "ROOT" || from.address().to_string() != root_ip_)
+            std::cerr << "Received req_conns_ack from not-root: " << env.src << " data: " << env.body << std::endl;
+
+        json body = env.body;
+
+        std::vector<json> jPeers = body["peers"];
+        std::vector<PeerInfo> peers;
+        for (auto& jp : jPeers) {
+            std::error_code ec;
+            auto peerAddr = asio::ip::make_address((jp.at("ip")).get<std::string>(), ec);
+            if (!ec){
+                PeerInfo p;
+                auto peerPort = jp.at("port").get<uint16_t>();
+                auto peerEp   = udp::endpoint(peerAddr, peerPort);
+                p.ep = peerEp;
+                p.last_seen = Clock::now();
+                p.peerId = jp.at("id").get<std::string>();
+                p.tkn = jp.at("token").get<std::string>();
+                peers.push_back(p);
+            } else {
+                std::cerr << "Peer's address: " << jp.at("ip") << ", couldn't be used" << ec.message() << std::endl;
+            }
+        }
+
+        int punch_ms = env.body["punch_ms"];
+        int timeout = env.body["timeout_ms"];
+        int ka = env.body["ka_ms"];
+        std::string tkn = env.body["token"];
+
+
+
+        for (const auto& p : peers) {
+            remember_token(p.peerId, p.tkn, 6000);
+            std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
+            start_punch(p, timeout, punch_ms, p.tkn);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Exception while registering req_conns_ack: " << e.what() << std::endl;
     }
 }
 
@@ -659,7 +755,7 @@ void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) 
     link_down(env.src);
 }
 
-void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) {
+void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) { //root function
     if (!is_root_) return;
     NodeId src = env.src;
     NodeId neigh = env.body.at("peer").get<NodeId>();
@@ -671,7 +767,7 @@ void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) {
           << "\n";
 }
 
-void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) {
+void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) { //root function
     if (!is_root_) return;
     NodeId src = env.src;
     NodeId neigh = env.body.at("peer").get<NodeId>();
@@ -777,7 +873,7 @@ void Node::prune_dead() {
     }
 }
 
-void Node::print_graph() {
+void Node::print_graph() { //root function
     if (!is_root_) {
         std::cout << "[ROOT GRAPH] not root\n";
         return;
@@ -814,6 +910,20 @@ void Node::prune_connections() {
 }
 
 
+void Node::update_parent() {
+    auto it = connections_.begin();
+    int min_level = it->second->level;
+    NodeId min_parent = it->first;
+    for (;it != connections_.end(); ++it) {
+        if (it->second->level < min_level) {
+            min_level = it->second->level;
+            min_parent = it->first;
+        }
+    }
+    daddy_ = min_parent;
+    level_ = min_level + 1;
+}
+
 void Node::rand_disconnect() {
     // disconnecting from a random connection because the connection limit has been exceeded.
     if (connections_.empty()) return;
@@ -846,8 +956,12 @@ void Node::remove_connection(const NodeId& peerId) {
     connections_.erase(it);
 
     linked_up_.erase(peerId);
-    if (cur_connections_ > 0) cur_connections_--;
+    if (cur_connections_ >= MIN_CONNS) cur_connections_--;
     else request_conns();
+
+    auto par = connections_.find(daddy_);
+    if (par == connections_.end())
+        update_parent();
 
     link_down(peerId);
 

@@ -13,7 +13,8 @@
 #define expiration_time_sec std::chrono::seconds(45)
 #define prune_sec std::chrono::seconds(10)
 
-constexpr int MAX_CONNS = 1;
+constexpr int MAX_CONNS = 3;
+constexpr int MIN_CONNS = 1;
 constexpr int ROOT_PORT = 12345;
 
 using udp = asio::ip::udp;
@@ -87,6 +88,8 @@ private:
 
     void on_register_ack(const udp::endpoint& from, const proto::Envelope& env);
 
+    void on_req_conns_ack(const udp::endpoint &from, const proto::Envelope &env);
+
     void remember_token(const std::string &peer_id, const std::string &token, int ttl_ms);
 
     void prune_tokens();
@@ -116,6 +119,8 @@ private:
     void handle_register_ack(const std::string& tx,
                              const PeerInfo& curP, const int want);
 
+    void send_up(proto::Envelope env);
+
     void request_conns();
 
     void broadcast(const std::string &msg);
@@ -139,6 +144,8 @@ private:
     void prune_tick();
 
     void prune_connections();
+
+    void update_parent();
 
     void prune_dead();
 
