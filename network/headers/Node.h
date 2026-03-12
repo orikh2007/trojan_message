@@ -8,10 +8,9 @@
 #include "networkSettings.h"
 #include "apiComm.h"
 #include <queue>
-
-#define attempt_budget 200
-#define expiration_time_sec std::chrono::seconds(45)
-#define prune_sec std::chrono::seconds(10)
+constexpr uint32_t attempt_budget = 200;
+constexpr auto expiration_time_sec = std::chrono::seconds(45);
+constexpr auto prune_sec = std::chrono::seconds(10);
 
 constexpr int MAX_CONNS = 3;
 constexpr int MIN_CONNS = 1;
@@ -38,6 +37,15 @@ struct Connection {
 struct TokenEntry {
     std::string peer_id;
     std::chrono::steady_clock::time_point expires;
+};
+
+enum class CircuitState { PUNCHING_ENTRY, EXTENDING, READY, FAILED };
+
+struct Circuit {
+    std::string circuit_id;
+    std::vector<NodeId> path;   // [relay1, relay2, ..., dst]  (excludes src)
+    int hops_confirmed = 0;     // how many CIRCUIT_EXTENDED confirmations received
+    CircuitState state = CircuitState::PUNCHING_ENTRY;
 };
 
 
@@ -145,8 +153,6 @@ private:
 
     void prune_connections();
 
-    void update_parent();
-
     void prune_dead();
 
     void print_graph();
@@ -156,6 +162,23 @@ private:
     void dynamic_disconnect(const NodeId& id);
 
     void remove_connection(const std::string &peerId);
+
+// ------------------------ onion routing ------------------------
+
+    void on_hop(const udp::endpoint &from, const proto::Envelope &env);
+
+    void on_node_list_req(const udp::endpoint &from, const proto::Envelope &env);  // root
+    void on_node_list_resp(const udp::endpoint &from, const proto::Envelope &env); // src
+    void on_introduce_req(const udp::endpoint &from, const proto::Envelope &env);  // root
+
+    void on_circuit_extend(const udp::endpoint &from, const proto::Envelope &env);   // relay
+    void on_circuit_extended(const udp::endpoint &from, const proto::Envelope &env); // src + relay
+
+    void request_introduce(const NodeId &target_id);  // send INTRODUCE_REQ to root (or handle locally if we are root)
+
+    void begin_circuit_build(const NodeId &dst, int num_relays = 2);
+    void send_next_extend(Circuit &c);
+    void send_via_circuit(const std::string &circuit_id, const std::string &data);
 
 // ------------------------ routing logic ------------------------
 
@@ -198,13 +221,21 @@ private:
 
     std::unordered_set<NodeId> linked_up_;
 
-    std::string gateway_;
-
     std::map<std::string, PeerInfo> clients_map_;
     std::vector<std::string> clients_;
     std::unordered_map<std::string, std::unique_ptr<Connection>> connections_;
 
     std::unordered_map<std::string, TokenEntry> token_cache_; // key=token
+
+    // onion routing — source side
+    std::unordered_map<std::string, Circuit> circuits_;           // circuit_id → Circuit
+    std::unordered_map<NodeId, std::string>  circuit_by_dst_;    // dst_id → circuit_id
+    std::vector<PeerInfo> node_list_candidates_;                  // from NODE_LIST_RESP
+    NodeId pending_circuit_dst_;                                  // dst waiting for NODE_LIST_RESP
+
+    // onion routing — relay side
+    std::unordered_map<std::string, NodeId> circuit_hop_table_;        // circuit_id → prev_hop_id
+    std::unordered_map<NodeId, std::string> pending_extend_circuits_;  // next_peer_id → circuit_id
 
 
 };

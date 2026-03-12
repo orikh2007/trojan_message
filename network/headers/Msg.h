@@ -61,17 +61,17 @@ enum class MsgType {
     ROUTE_REQ,
     ROUTE_RESP,
     REQ_CONNS,
-    REQ_CONNS_ACK
+    REQ_CONNS_ACK,
+    NODE_LIST_REQ,
+    NODE_LIST_RESP,
+    CIRCUIT_EXTEND,
+    CIRCUIT_EXTENDED,
+    INTRODUCE_REQ
 };
 
-struct HopMessage {
-    MsgType type = MsgType::HOP;
-    std::string src;
-    std::string dst;
-    std::string nxt;
-    uint16_t ttl;
-    std::string payload;
-
+struct OnionLayer {
+    std::string next_id;  // next hop NodeId; empty string = "deliver here"
+    std::string payload;  // b64(inner OnionLayer JSON)  or  b64(final data)
 };
 
 inline std::string to_string(const MsgType t) {
@@ -94,6 +94,11 @@ inline std::string to_string(const MsgType t) {
         case MsgType::ROUTE_RESP:        return "ROUTE_RESP";
         case MsgType::REQ_CONNS:        return "REQ_CONNS";
         case MsgType::REQ_CONNS_ACK:    return "REQ_CONNS_ACK";
+        case MsgType::NODE_LIST_REQ:    return "NODE_LIST_REQ";
+        case MsgType::NODE_LIST_RESP:   return "NODE_LIST_RESP";
+        case MsgType::CIRCUIT_EXTEND:   return "CIRCUIT_EXTEND";
+        case MsgType::CIRCUIT_EXTENDED: return "CIRCUIT_EXTENDED";
+        case MsgType::INTRODUCE_REQ:    return "INTRODUCE_REQ";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -118,6 +123,11 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "ROUTE_RESP") return MsgType::ROUTE_RESP;
     if (s == "REQ_CONNS") return MsgType::REQ_CONNS;
     if (s == "REQ_CONNS_ACK") return MsgType::REQ_CONNS_ACK;
+    if (s == "NODE_LIST_REQ") return MsgType::NODE_LIST_REQ;
+    if (s == "NODE_LIST_RESP") return MsgType::NODE_LIST_RESP;
+    if (s == "CIRCUIT_EXTEND") return MsgType::CIRCUIT_EXTEND;
+    if (s == "CIRCUIT_EXTENDED") return MsgType::CIRCUIT_EXTENDED;
+    if (s == "INTRODUCE_REQ")   return MsgType::INTRODUCE_REQ;
     return std::nullopt;
 }
 
@@ -300,15 +310,10 @@ inline std::string dump_compact(const json& j) {
     return j.dump(-1); // compact JSON
 }
 
-// ---------------------------
-// Message builders
-// ---------------------------
 
-inline json msg_hop(std::string payload, const NodeId &src) {
-    json body;
-    body["payload"] = payload;
-    return make_envelope(MsgType::HOP, src, random_tx_id(), body);
-}
+    // ---------------------------
+    // Message builders
+    // ---------------------------
 
 inline json msg_req_conns(const NodeId& node_id, uint16_t listen_port, int want_peers = 4) {
     json body;
@@ -449,6 +454,41 @@ inline  std::vector<uint8_t> to_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
+    //--ONION PACKETS
+
+
+inline json onion_layer_to_json(const OnionLayer& l) {
+    json j;
+    j["next_id"] = l.next_id;
+    j["payload"] = l.payload;
+    return j;
+}
+
+inline OnionLayer onion_layer_from_json(const json& j) {
+    return { j.at("next_id").get<std::string>(), j.at("payload").get<std::string>() };
+}
+
+    // path = [relay1, relay2, ..., dst]  (excludes src)
+    // Returns the outermost OnionLayer as JSON — caller b64-encodes it and puts it in a HOP payload.
+    // Convention: HOP.body["payload"] is always b64(OnionLayer_json).
+    inline json build_onion(const std::vector<NodeId>& path, const std::string& data) {
+    require(!path.empty(), "onion path must not be empty");
+    // Innermost layer: destination decodes b64(data)
+    OnionLayer cur{ "", b64_encode(to_bytes(data)) };
+    // Wrap from second-to-last node back to first
+    for (int i = static_cast<int>(path.size()) - 2; i >= 0; --i) {
+        std::string inner = onion_layer_to_json(cur).dump(-1);
+        cur = OnionLayer{ path[i + 1], b64_encode(to_bytes(inner)) };
+    }
+    return onion_layer_to_json(cur);
+}
+
+inline json msg_hop(std::string payload, const NodeId &src) {
+    json body;
+    body["payload"] = payload;
+    return make_envelope(MsgType::HOP, src, random_tx_id(), body);
+}
+
 inline json msg_data_b64(const std::string& node_id, const std::string& to_id,
                          uint32_t seq, const std::vector<uint8_t>& payload_bytes) {
     /*
@@ -464,6 +504,52 @@ inline json msg_data_b64(const std::string& node_id, const std::string& to_id,
     body["enc"] = "b64";
 
     return make_envelope(MsgType::DATA, node_id, random_tx_id(), body);
+}
+
+inline json msg_node_list_req(const NodeId& node_id, int want = 4) {
+    json body;
+    body["want"] = want;
+    return make_envelope(MsgType::NODE_LIST_REQ, node_id, random_tx_id(), body);
+}
+
+inline json msg_node_list_resp(const std::string& tx, const std::vector<PeerInfo>& peers) {
+    json body;
+    std::vector<json> peersJ;
+    for (const auto& p : peers) {
+        json pj;
+        pj["id"]   = p.peerId;
+        pj["ip"]   = p.ep.address().to_string();
+        pj["port"] = p.ep.port();
+        peersJ.push_back(pj);
+    }
+    body["peers"] = peersJ;
+    return make_envelope(MsgType::NODE_LIST_RESP, "ROOT", tx, body);
+}
+
+inline json msg_circuit_extend(const NodeId& src,
+                               const std::string& circuit_id,
+                               const NodeId& next_id) {
+    json body;
+    body["circuit_id"] = circuit_id;
+    body["next_id"]    = next_id;
+    return make_envelope(MsgType::CIRCUIT_EXTEND, src, random_tx_id(), body);
+}
+
+inline json msg_introduce_req(const NodeId& src, const NodeId& target_id) {
+    json body;
+    body["target_id"] = target_id;
+    return make_envelope(MsgType::INTRODUCE_REQ, src, random_tx_id(), body);
+}
+
+inline json msg_circuit_extended(const NodeId& src,
+                                 const std::string& circuit_id,
+                                 const NodeId& next_id,
+                                 bool success) {
+    json body;
+    body["circuit_id"] = circuit_id;
+    body["next_id"]    = next_id;
+    body["success"]    = success;
+    return make_envelope(MsgType::CIRCUIT_EXTENDED, src, random_tx_id(), body);
 }
 
 inline json msg_error(const std::string& tx, std::string code, std::string detail) {
