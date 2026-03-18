@@ -918,12 +918,6 @@ void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env
     std::cout << "[GRAPH] updated " << node << " neighbors=" << entry.neighbors.size()
               << " seq=" << seq << "\n";
 
-    // Node has no more connections — remove it from local graph
-    if (entry.neighbors.empty() && node != node_id_) {
-        clients_map_.erase(node);
-        std::cout << "[GRAPH] removed " << node << " (no neighbors)\n";
-    }
-
     // Initial snapshot messages are point-to-point from root - don't re-flood
     if (initial) return;
 
@@ -933,6 +927,12 @@ void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env
     for (const auto& [id, conn] : connections_) {
         if (id != env.src && conn && conn->connected)
             send_text(conn->ep, fwd);
+    }
+
+    // Node has no more connections — remove it from local graph
+    if (entry.neighbors.empty() && node != node_id_) {
+        clients_map_.erase(node);
+        std::cout << "[GRAPH] removed " << node << " (no neighbors)\n";
     }
 }
 
