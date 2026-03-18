@@ -241,7 +241,7 @@ void Node::request_conns() {
     const auto data = proto::dump_compact(j);
     std::error_code ec;
     send_text(root_ep_, data);
-    std::cout << "Sent root req_conns";
+    std::cout << "Sent root req_conns" << "\n";
 }
 
 void Node::handle_dis() {
@@ -259,7 +259,7 @@ void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, cons
     std::vector<PeerInfo> peers;
 
     std::vector<std::string> keys;
-    for (const auto& [id, _] : clients_map_) keys.push_back(id);
+    for (const auto &id: clients_map_ | std::views::keys) keys.push_back(id);
     std::random_device rd;
     std::mt19937 gen{rd()};
     std::ranges::shuffle(keys, gen);
@@ -941,6 +941,7 @@ void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) { //
           << " deg(neigh)=" << clients_map_[neigh].neighbors.size()
           << "\n";
     broadcast_graph_update(src);
+    broadcast_graph_update(neigh);
     if (neigh == node_id_) broadcast_graph_update(node_id_);
 }
 
@@ -1082,11 +1083,18 @@ void Node::print_graph() { //root function
         }
     }
     std::cout << "edge_count=" << edges << "\n";
+
+    for (const auto& [u, pu] : connections_) {
+        std::cout << u << " --> " << pu->ep.address().to_string() << ":" << pu->ep.port() << "\n";
+    }
     std::cout << "================================\n\n";
 }
 
 void Node::prune_connections() {
-    if (cur_connections_ >= MAX_CONNS) rand_disconnect();
+    if (cur_connections_ >= MAX_CONNS) {
+        std::cout << "too many connections " << cur_connections_ << " - disconnecting from someone" << std::endl;
+        rand_disconnect();
+    }
 }
 
 
@@ -1123,7 +1131,7 @@ void Node::remove_connection(const NodeId& peerId) {
     connections_.erase(it);
 
     linked_up_.erase(peerId);
-    if (cur_connections_ >= MIN_CONNS) cur_connections_--;
+    if (cur_connections_ > MIN_CONNS) cur_connections_--;
     else request_conns();
 
     auto par = connections_.find(daddy_);
@@ -1437,26 +1445,33 @@ bool Node::try_inject_detour(std::vector<NodeId>& path, size_t edge_i) const
     forbidden.erase(u);
     forbidden.erase(v);
 
-    auto detour_opt = bfs_shortest_path(u, v, forbidden);
-    if (!detour_opt) return false;
+    // Force at least one intermediate node by starting BFS from u's neighbors (skipping v).
+    // Add u itself to forbidden so the sub-BFS can't loop back through it.
+    forbidden.insert(u);
+    auto u_it = clients_map_.find(u);
+    if (u_it == clients_map_.end()) return false;
 
-    const auto& detour = *detour_opt;
+    std::vector<NodeId> best;
+    for (const auto& w : u_it->second.neighbors) {
+        if (w == v || forbidden.contains(w)) continue;
+        auto sub = bfs_shortest_path(w, v, forbidden);
+        if (!sub) continue;
+        // sub = [w, ..., v]; full detour = [u, w, ..., v]
+        if (best.empty() || sub->size() < best.size()) best = *sub;
+    }
+    if (best.empty()) return false;
 
-    // detour must be longer than direct edge (length >= 3 nodes => >=2 edges)
-    if (detour.size() < 3) return false;
-
-    // Splice: replace [u, v] with [u, x, ..., v]
-    // path = prefix(0..edge_i) + detour(1..end-2) + suffix(edge_i+1..end)
+    // Splice: replace [u, v] with [u, w, ..., v]
     std::vector<NodeId> out;
-    out.reserve(path.size() + detour.size());
+    out.reserve(path.size() + best.size());
 
     // prefix includes u
     out.insert(out.end(), path.begin(), path.begin() + static_cast<long long>(edge_i) + 1);
 
-    // middle: detour without endpoints
-    out.insert(out.end(), detour.begin() + 1, detour.end() - 1);
+    // middle: w..(v excluded — v is the start of the suffix)
+    out.insert(out.end(), best.begin(), best.end() - 1);
 
-    // suffix starts at v
+    // suffix starts at v (path[edge_i+1])
     out.insert(out.end(), path.begin() + static_cast<long long>(edge_i) + 1, path.end());
 
     path.swap(out);
@@ -1494,15 +1509,6 @@ std::optional<std::vector<NodeId>> Node::compute_route(
     std::random_device rd;
     std::mt19937 rng(rd());
 
-    // Safety: you can't have a simple path longer than N-1 edges.
-    // This isn't a "max hops" feature-it's a graph reality constraint.
-    const int N = static_cast<int>(clients_map_.size());
-    const int max_possible_simple_hops = std::max(0, N - 1);
-    if (min_hops > max_possible_simple_hops) {
-        // impossible without repeats
-        return std::nullopt;
-    }
-
     // Keep trying to inject detours until we reach min_hops
     // Bound the work so we don't loop forever on hard graphs.
     int attempts = 0;
@@ -1520,10 +1526,9 @@ std::optional<std::vector<NodeId>> Node::compute_route(
         (void)try_inject_detour(path, edge_i);
     }
 
-    if (hops() < min_hops) {
-        // Graph too small / constrained to reach min hops without repeats
-        return std::nullopt;
-    }
+    if (hops() < min_hops)
+        std::cout << "[CIRCUIT] graph topology only allows " << hops()
+                  << " hops (wanted " << min_hops << ") — using best available path\n";
 
     return path;
 }

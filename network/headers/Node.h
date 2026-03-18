@@ -12,7 +12,7 @@ constexpr uint32_t attempt_budget = 200;
 constexpr auto expiration_time_sec = std::chrono::seconds(45);
 constexpr auto prune_sec = std::chrono::seconds(10);
 
-constexpr int MAX_CONNS = 3;
+constexpr int MAX_CONNS = 4;
 constexpr int MIN_CONNS = 1;
 constexpr int ROOT_PORT = 12345;
 constexpr int MIN_RELAYS = 1;
