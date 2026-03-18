@@ -1181,26 +1181,70 @@ void Node::on_node_list_resp(const udp::endpoint& from, const proto::Envelope& e
 }
 
 void Node::begin_circuit_build(const NodeId& dst, int num_relays) {
-    if (static_cast<int>(node_list_candidates_.size()) < num_relays) {
-        std::cerr << "[CIRCUIT] not enough candidates (have " << node_list_candidates_.size()
-                  << ", need " << num_relays << "). Run 'circuit' again.\n";
+    // dst must never appear as a relay — it would corrupt circuit_hop_table_ when used twice
+    auto& cands = node_list_candidates_;
+    cands.erase(std::remove_if(cands.begin(), cands.end(),
+        [&](const PeerInfo& p) { return p.peerId == dst; }), cands.end());
+
+    if (cands.empty()) {
+        std::cerr << "[CIRCUIT] no relay candidates available (all were dst). Run 'circuit' again.\n";
         return;
     }
 
+    // Prefer a directly-connected node as the first relay to skip hole-punching
+    auto connected_it = std::find_if(cands.begin(), cands.end(),
+        [&](const PeerInfo& p) { return linked_up_.contains(p.peerId); });
+    if (connected_it != cands.end() && connected_it != cands.begin())
+        std::swap(*connected_it, cands[0]);
+
+    const int n = static_cast<int>(cands.size());
+
     Circuit c;
     c.circuit_id = proto::random_tx_id();
-    for (int i = 0; i < num_relays; ++i)
-        c.path.push_back(node_list_candidates_[i].peerId);
+
+    // Build relay list; cycles through candidates if num_relays > n.
+    // Only constraint: no two consecutive hops are the same node.
+    for (int i = 0; i < num_relays; ++i) {
+        const NodeId& prev = c.path.empty() ? NodeId{} : c.path.back();
+        for (int j = 0; j < n; ++j) {
+            const NodeId& cand = node_list_candidates_[(i + j) % n].peerId;
+            if (cand != prev) {
+                c.path.push_back(cand);
+                break;
+            }
+        }
+    }
+    // Ensure the last relay != dst before appending dst
+    if (!c.path.empty() && c.path.back() == dst) {
+        for (int j = 0; j < n; ++j) {
+            const NodeId& cand = node_list_candidates_[j % n].peerId;
+            if (cand != dst) {
+                c.path.push_back(cand);
+                break;
+            }
+        }
+    }
     c.path.push_back(dst);
     c.hops_confirmed = 0;
-    c.state = CircuitState::PUNCHING_ENTRY;
+
+    std::cout << "[CIRCUIT " << c.circuit_id << "] planned path: " << node_id_;
+    for (const auto& hop : c.path) std::cout << " -> " << hop;
+    std::cout << "\n";
+
+    const bool relay1_connected = linked_up_.contains(c.path[0]);
+    c.state = relay1_connected ? CircuitState::EXTENDING : CircuitState::PUNCHING_ENTRY;
     circuits_[c.circuit_id] = c;
     circuit_by_dst_[dst] = c.circuit_id;
 
-    // Ask root to introduce src <-> relay1; both will punch each other simultaneously
-    request_introduce(node_list_candidates_[0].peerId);
-
-    std::cout << "[CIRCUIT " << c.circuit_id << "] building — asked root to introduce src <-> " << node_list_candidates_[0].peerId << "\n";
+    if (relay1_connected) {
+        std::cout << "[CIRCUIT " << c.circuit_id << "] relay1 " << c.path[0]
+                  << " already connected — skipping punch, extending directly\n";
+        send_next_extend(circuits_[c.circuit_id]);
+    } else {
+        // Ask root to introduce src <-> relay1; both will punch each other simultaneously
+        request_introduce(c.path[0]);
+        std::cout << "[CIRCUIT " << c.circuit_id << "] building — asked root to introduce src <-> " << c.path[0] << "\n";
+    }
 }
 
 void Node::send_next_extend(Circuit& c) {
@@ -1209,7 +1253,10 @@ void Node::send_next_extend(Circuit& c) {
     // hops_confirmed == path.size()-1 means every consecutive pair is connected
     if (c.hops_confirmed == static_cast<int>(c.path.size()) - 1) {
         c.state = CircuitState::READY;
-        std::cout << "[CIRCUIT " << c.circuit_id << "] READY — use 'sanon "
+        std::cout << "[CIRCUIT " << c.circuit_id << "] READY — path: " << node_id_;
+        for (const auto& hop : c.path) std::cout << " -> " << hop;
+        std::cout << "\n";
+        std::cout << "[CIRCUIT " << c.circuit_id << "] use 'sanon "
                   << c.path.back() << " <message>'\n";
         return;
     }
@@ -1297,7 +1344,10 @@ void Node::on_circuit_extended(const udp::endpoint& from, const proto::Envelope&
         std::cout << "[CIRCUIT " << circuit_id << "] hops_confirmed=" << c.hops_confirmed << "\n";
         if (c.hops_confirmed == static_cast<int>(c.path.size()) - 1) {
             c.state = CircuitState::READY;
-            std::cout << "[CIRCUIT " << circuit_id << "] READY — use 'sanon " << circuit_id << " <message>'\n";
+            std::cout << "[CIRCUIT " << circuit_id << "] READY — path: " << node_id_;
+            for (const auto& hop : c.path) std::cout << " -> " << hop;
+            std::cout << "\n";
+            std::cout << "[CIRCUIT " << circuit_id << "] use 'sanon " << c.path.back() << " <message>'\n";
         } else {
             send_next_extend(c);
         }
@@ -1341,7 +1391,7 @@ static std::vector<NodeId> reconstruct_path(
         cur = it->second;
         path.push_back(cur);
     }
-    std::reverse(path.begin(), path.end());
+    std::ranges::reverse(path.begin(), path.end());
     return path;
 }
 

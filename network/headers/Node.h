@@ -15,6 +15,7 @@ constexpr auto prune_sec = std::chrono::seconds(10);
 constexpr int MAX_CONNS = 3;
 constexpr int MIN_CONNS = 1;
 constexpr int ROOT_PORT = 12345;
+constexpr int relay_num = 1;
 
 using udp = asio::ip::udp;
 using MsgType = proto::MsgType;
@@ -176,7 +177,7 @@ private:
 
     void request_introduce(const NodeId &target_id);  // send INTRODUCE_REQ to root (or handle locally if we are root)
 
-    void begin_circuit_build(const NodeId &dst, int num_relays = 2);
+    void begin_circuit_build(const NodeId &dst, int num_relays = relay_num);
     void send_next_extend(Circuit &c);
     void send_via_circuit(const std::string &circuit_id, const std::string &data);
 
