@@ -4,7 +4,7 @@
 
 #ifndef TROJAN_MESSAGE_NODE_H
 #define TROJAN_MESSAGE_NODE_H
-#include "msg.h"
+#include "Msg.h"
 #include "networkSettings.h"
 #include "apiComm.h"
 #include <queue>
@@ -15,7 +15,9 @@ constexpr auto prune_sec = std::chrono::seconds(10);
 constexpr int MAX_CONNS = 3;
 constexpr int MIN_CONNS = 1;
 constexpr int ROOT_PORT = 12345;
-constexpr int relay_num = 1;
+constexpr int MIN_RELAYS = 1;
+constexpr int MAX_RELAYS = 4;
+constexpr int MIN_GRAPH_SIZE = 2; // minimum nodes in local graph to attempt circuit building
 
 using udp = asio::ip::udp;
 using MsgType = proto::MsgType;
@@ -168,16 +170,17 @@ private:
 
     void on_hop(const udp::endpoint &from, const proto::Envelope &env);
 
-    void on_node_list_req(const udp::endpoint &from, const proto::Envelope &env);  // root
-    void on_node_list_resp(const udp::endpoint &from, const proto::Envelope &env); // src
     void on_introduce_req(const udp::endpoint &from, const proto::Envelope &env);  // root
+    void on_graph_update(const udp::endpoint &from, const proto::Envelope &env);
+    void broadcast_graph_update(const NodeId &node);  // root only
+    void send_graph_snapshot(const udp::endpoint &to); // root only
 
     void on_circuit_extend(const udp::endpoint &from, const proto::Envelope &env);   // relay
     void on_circuit_extended(const udp::endpoint &from, const proto::Envelope &env); // src + relay
 
     void request_introduce(const NodeId &target_id);  // send INTRODUCE_REQ to root (or handle locally if we are root)
 
-    void begin_circuit_build(const NodeId &dst, int num_relays = relay_num);
+    void begin_circuit_build(const NodeId &dst);
     void send_next_extend(Circuit &c);
     void send_via_circuit(const std::string &circuit_id, const std::string &data);
 
@@ -223,16 +226,16 @@ private:
     std::unordered_set<NodeId> linked_up_;
 
     std::map<std::string, PeerInfo> clients_map_;
-    std::vector<std::string> clients_;
     std::unordered_map<std::string, std::unique_ptr<Connection>> connections_;
 
     std::unordered_map<std::string, TokenEntry> token_cache_; // key=token
 
+    std::unordered_map<NodeId, uint64_t> graph_seq_;  // dedup: node_id → last seq seen
+    std::unordered_map<NodeId, uint64_t> graph_seq_out_; // root only: per-node broadcast counter
+
     // onion routing — source side
     std::unordered_map<std::string, Circuit> circuits_;           // circuit_id → Circuit
     std::unordered_map<NodeId, std::string>  circuit_by_dst_;    // dst_id → circuit_id
-    std::vector<PeerInfo> node_list_candidates_;                  // from NODE_LIST_RESP
-    NodeId pending_circuit_dst_;                                  // dst waiting for NODE_LIST_RESP
 
     // onion routing — relay side
     std::unordered_map<std::string, NodeId> circuit_hop_table_;        // circuit_id → prev_hop_id

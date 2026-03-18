@@ -4,9 +4,6 @@
 
 #include "../headers/Node.h"
 
-void erase_client_id(std::vector<NodeId>& v, const NodeId& id) {
-    v.erase(std::remove(v.begin(), v.end(), id), v.end());
-}
 
 Node::Node(const uint16_t listen_port)
     : ip_(getIP(v4)),
@@ -22,8 +19,7 @@ Node::Node(const uint16_t listen_port)
       level_(-1),
       cur_connections_(0),
       prune_timer_(io_),
-      clients_map_(),
-      clients_() {
+      clients_map_() {
     std::cout << "starting node init" << std::endl;
     std::error_code ec;
 
@@ -71,7 +67,6 @@ void Node::become_root() {
     me.peerId = node_id_;
     me.ep = ep_;
     me.last_seen = Clock::now();
-    clients_.push_back(me.peerId);
     clients_map_.insert_or_assign(me.peerId, me);
     rebind();
 } //become the root - tell dynu and everyone you're the root
@@ -136,10 +131,11 @@ void Node::handle_command(const std::string& line) {
             iss >> dst;
             if (dst.empty()) { std::cout << "Usage: circuit <dst_id>\n"; }
             else {
-                pending_circuit_dst_ = dst;
-                const auto j = proto::msg_node_list_req(node_id_);
-                send_text(root_ep_, proto::dump_compact(j));
-                std::cout << "Requesting node list from root, will build circuit to " << dst << "...\n";
+                if (static_cast<int>(clients_map_.size()) < MIN_GRAPH_SIZE) {
+                    std::cerr << "Graph not populated yet - wait for GRAPH_UPDATE broadcasts.\n";
+                } else {
+                    begin_circuit_build(dst);
+                }
             }
         } else if (cmd == "sanon") {
             NodeId dst;
@@ -258,17 +254,18 @@ void Node::handle_dis() {
 }
 
 void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) { //root function
-    const size_t size = clients_.size();
-    int n = std::min(static_cast<int>(size)-1, 4);
+    int n = std::min(static_cast<int>(clients_map_.size()) - 1, 4);
     n = std::min(n, want);
     std::vector<PeerInfo> peers;
 
+    std::vector<std::string> keys;
+    for (const auto& [id, _] : clients_map_) keys.push_back(id);
     std::random_device rd;
-    std::mt19937 gen {rd()};
-    std::ranges::shuffle(clients_, gen);
+    std::mt19937 gen{rd()};
+    std::ranges::shuffle(keys, gen);
 
-    for (size_t i = 0; i < clients_.size() && peers.size() < static_cast<size_t>(n); ++i) {
-        const std::string& cli = clients_[i];
+    for (const auto& cli : keys) {
+        if (static_cast<int>(peers.size()) >= n) break;
         if (cli == curP.peerId) continue;
         clients_map_.at(cli).tkn = proto::random_token_hex();
         peers.push_back(clients_map_.at(cli));
@@ -459,11 +456,8 @@ void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
         case MsgType::HOP:
             on_hop(from, env);
             break;
-        case MsgType::NODE_LIST_REQ:
-            on_node_list_req(from, env);
-            break;
-        case MsgType::NODE_LIST_RESP:
-            on_node_list_resp(from, env);
+        case MsgType::GRAPH_UPDATE:
+            on_graph_update(from, env);
             break;
         case MsgType::CIRCUIT_EXTEND:
             on_circuit_extend(from, env);
@@ -491,7 +485,6 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) { 
         p.peerId = env.src;
         std::cout << "K: " << env.src << " T: " << p.peerId << std::endl;
         clients_map_[env.src] = p;
-        clients_.push_back(p.peerId);
 
         int want = env.body.at("want_peers").get<int>();
 
@@ -501,6 +494,7 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) { 
         std::cout   << "here's his info: " << clients_map_[p.peerId].ep.address() << ":" << clients_map_[env.src].ep.port() << std::endl;
 
         handle_register_ack(tx, p, want);
+        send_graph_snapshot(from);
     } catch (const std::exception& e) {
         std::cerr << "Bad register message from " << from.address().to_string() << ": " << e.what();
     }
@@ -518,17 +512,18 @@ void Node::on_req_conns(const udp::endpoint& from, const proto::Envelope& env) {
     }
     const PeerInfo& curP = cur->second;
 
-    const size_t size = clients_.size();
-    int n = std::min(static_cast<int>(size)-1, MAX_CONNS);
+    int n = std::min(static_cast<int>(clients_map_.size()) - 1, MAX_CONNS);
     n = std::min(n, want);
     std::vector<PeerInfo> peers;
 
+    std::vector<std::string> keys;
+    for (const auto& [id, _] : clients_map_) keys.push_back(id);
     std::random_device rd;
-    std::mt19937 gen {rd()};
-    std::ranges::shuffle(clients_, gen);
+    std::mt19937 gen{rd()};
+    std::ranges::shuffle(keys, gen);
 
-    for (size_t i = 0; i < clients_.size() && peers.size() < static_cast<size_t>(n); ++i) {
-        const std::string& cli = clients_[i];
+    for (const auto& cli : keys) {
+        if (static_cast<int>(peers.size()) >= n) break;
         if (cli == curP.peerId) continue;
         if (clients_map_.at(curP.peerId).neighbors.contains(cli)) continue;
         clients_map_.at(cli).tkn = proto::random_token_hex();
@@ -852,7 +847,7 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
     }
 
     if (layer.next_id.empty()) {
-        // Terminal — deliver here
+        // Terminal - deliver here
         auto inner = proto::b64_decode(layer.payload);
         if (!inner) { std::cerr << "on_hop: inner b64_decode failed\n"; return; }
         std::string inner_str(inner->begin(), inner->end());
@@ -866,7 +861,7 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
             std::cout << "[HOP] delivered: " << inner_str << "\n";
         }
     } else {
-        // Relay — forward payload to next hop (layer.payload is already b64 of next layer)
+        // Relay - forward payload to next hop (layer.payload is already b64 of next layer)
         auto it = connections_.find(layer.next_id);
         if (it == connections_.end() || !it->second || !it->second->connected) {
             std::cerr << "on_hop: no connection to " << layer.next_id << "\n";
@@ -882,41 +877,95 @@ void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) 
     link_down(env.src);
 }
 
+void Node::broadcast_graph_update(const NodeId& node) { // root only
+    auto it = clients_map_.find(node);
+    if (it == clients_map_.end()) return;
+    const uint64_t seq = ++graph_seq_out_[node];
+    const json msg = proto::msg_graph_update(node_id_, node, it->second.neighbors, seq);
+    const std::string data = proto::dump_compact(msg);
+    for (const auto& [id, conn] : connections_) {
+        if (conn && conn->connected) send_text(conn->ep, data);
+    }
+    std::cout << "[ROOT] broadcast GRAPH_UPDATE for " << node << " seq=" << seq << "\n";
+}
+
+void Node::send_graph_snapshot(const udp::endpoint& to) { // root only
+    for (const auto& [id, entry] : clients_map_) {
+        const uint64_t seq = ++graph_seq_out_[id];
+        const json msg = proto::msg_graph_update(node_id_, id, entry.neighbors, seq, true);
+        send_text(to, proto::dump_compact(msg));
+    }
+    std::cout << "[ROOT] sent graph snapshot (" << clients_map_.size() << " nodes) to "
+              << to.address() << ":" << to.port() << "\n";
+}
+
+void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env) {
+    const NodeId node     = env.body.at("node").get<std::string>();
+    const uint64_t seq    = env.body.at("seq").get<uint64_t>();
+    const json& neigh_arr = env.body.at("neighbors");
+    const bool initial    = env.body.value("initial", false);
+
+    // Dedup: drop if we've already seen this seq for this node
+    if (auto it = graph_seq_.find(node); it != graph_seq_.end() && seq <= it->second) return;
+    graph_seq_[node] = seq;
+
+    // Upsert into local graph
+    auto& entry = clients_map_[node];
+    entry.peerId = node;
+    entry.neighbors.clear();
+    for (const auto& n : neigh_arr) entry.neighbors.insert(n.get<std::string>());
+
+    std::cout << "[GRAPH] updated " << node << " neighbors=" << entry.neighbors.size()
+              << " seq=" << seq << "\n";
+
+    // Initial snapshot messages are point-to-point from root - don't re-flood
+    if (initial) return;
+
+    // Re-flood to all connections except the sender
+    const std::string fwd = proto::dump_compact(
+        proto::msg_graph_update(node_id_, node, entry.neighbors, seq));
+    for (const auto& [id, conn] : connections_) {
+        if (id != env.src && conn && conn->connected)
+            send_text(conn->ep, fwd);
+    }
+}
+
 void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) { //root function
     if (!is_root_) return;
-    NodeId src = env.src;
-    NodeId neigh = env.body.at("peer").get<NodeId>();
+    const NodeId src   = env.src;
+    const NodeId neigh = env.body.at("peer").get<NodeId>();
     clients_map_[src].neighbors.insert(neigh);
     clients_map_[neigh].neighbors.insert(src);
     std::cout << "[ROOT GRAPH] " << src << " <-> " << neigh
           << " | deg(src)=" << clients_map_[src].neighbors.size()
           << " deg(neigh)=" << clients_map_[neigh].neighbors.size()
           << "\n";
+    broadcast_graph_update(src);
+    if (neigh == node_id_) broadcast_graph_update(node_id_);
 }
 
 void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) { //root function
     if (!is_root_) return;
-    NodeId src = env.src;
-    NodeId neigh = env.body.at("peer").get<NodeId>();
-    auto src_it = clients_map_.find(src);
+    const NodeId src   = env.src;
+    const NodeId neigh = env.body.at("peer").get<NodeId>();
+    auto src_it   = clients_map_.find(src);
     auto neigh_it = clients_map_.find(neigh);
 
     if (neigh_it != clients_map_.end()) clients_map_[neigh].neighbors.erase(src);
-    if (src_it != clients_map_.end()) clients_map_[src].neighbors.erase(neigh);
+    if (src_it   != clients_map_.end()) clients_map_[src].neighbors.erase(neigh);
 
-    if (clients_map_[neigh].neighbors.empty() && neigh != node_id_) {
-        clients_map_.erase(neigh);
-        erase_client_id(clients_, neigh);
+    // Remove node from graph if it has no more connections; otherwise broadcast updated state
+    if (auto it = clients_map_.find(neigh); it != clients_map_.end()) {
+        if (it->second.neighbors.empty() && neigh != node_id_)
+            clients_map_.erase(it);
+        else
+            broadcast_graph_update(neigh);
     }
-    if (auto it = clients_map_.find(neigh); it != clients_map_.end()
-    && it->second.neighbors.empty() && neigh != node_id_) {
-        clients_map_.erase(it);
-        erase_client_id(clients_, neigh);
-    }
-    if (auto it = clients_map_.find(src); it != clients_map_.end()
-        && it->second.neighbors.empty() && src != node_id_) {
-        clients_map_.erase(it);
-        erase_client_id(clients_, src);
+    if (auto it = clients_map_.find(src); it != clients_map_.end()) {
+        if (it->second.neighbors.empty() && src != node_id_)
+            clients_map_.erase(it);
+        else
+            broadcast_graph_update(src);
     }
 }
 
@@ -1010,12 +1059,7 @@ void Node::prune_dead() {
 }
 
 void Node::print_graph() { //root function
-    if (!is_root_) {
-        std::cout << "[ROOT GRAPH] not root\n";
-        return;
-    }
-
-    std::cout << "\n========== ROOT GRAPH ==========\n";
+    std::cout << "\n==========  GRAPH  ==========\n";
     std::cout << "nodes: " << clients_map_.size() << "\n";
 
     // Per-node summary
@@ -1048,7 +1092,7 @@ void Node::prune_connections() {
 
 void Node::rand_disconnect() {
     // disconnecting from a random connection because the connection limit has been exceeded.
-    // daddy_ is excluded — dropping the parent would orphan us.
+    // daddy_ is excluded - dropping the parent would orphan us.
     std::vector<NodeId> candidates;
     for (auto& [id, _] : connections_) {
         if (id != daddy_) candidates.push_back(id);
@@ -1094,33 +1138,10 @@ void Node::remove_connection(const NodeId& peerId) {
 
 // ------------------------ onion routing ------------------------
 
-void Node::on_node_list_req(const udp::endpoint& from, const proto::Envelope& env) {
-    if (!is_root_) return;
-    int want = env.body.value("want", 4);
-
-    const size_t size = clients_.size();
-    int n = std::min(static_cast<int>(size) - 1, want);
-    std::vector<PeerInfo> peers;
-
-    std::random_device rd;
-    std::mt19937 gen{rd()};
-    std::ranges::shuffle(clients_, gen);
-
-    for (size_t i = 0; i < clients_.size() && static_cast<int>(peers.size()) < n; ++i) {
-        const std::string& cli = clients_[i];
-        if (cli == env.src) continue;
-        peers.push_back(clients_map_.at(cli));
-    }
-
-    const json resp = proto::msg_node_list_resp(env.tx, peers);
-    send_text(from, proto::dump_compact(resp));
-    std::cout << "[ROOT] sent node list (" << peers.size() << " nodes) to " << env.src << "\n";
-}
-
 void Node::request_introduce(const NodeId& target_id) {
     const json req = proto::msg_introduce_req(node_id_, target_id);
     if (is_root_) {
-        // We are root — dispatch directly without a UDP round-trip
+        // We are root - dispatch directly without a UDP round-trip
         const proto::Envelope env = proto::parse_envelope(proto::dump_compact(req));
         on_introduce_req(ep_, env);
     } else {
@@ -1150,81 +1171,34 @@ void Node::on_introduce_req(const udp::endpoint& from, const proto::Envelope& en
     const json intro_to_req = proto::msg_introduce(tgt_peer, token);
     send_text(req_peer.ep, proto::dump_compact(intro_to_req));
 
-    // Tell target about requester (target will punch requester) — simultaneous open
+    // Tell target about requester (target will punch requester) - simultaneous open
     const json intro_to_tgt = proto::msg_introduce(req_peer, token);
     send_text(tgt_peer.ep, proto::dump_compact(intro_to_tgt));
 
     std::cout << "[ROOT] introduced " << requester_id << " <-> " << target_id << "\n";
 }
 
-void Node::on_node_list_resp(const udp::endpoint& from, const proto::Envelope& env) {
-    node_list_candidates_.clear();
-    for (const auto& jp : env.body.at("peers")) {
-        std::error_code ec;
-        auto addr = asio::ip::make_address(jp.at("ip").get<std::string>(), ec);
-        if (ec) continue;
-        PeerInfo p;
-        p.ep        = udp::endpoint(addr, jp.at("port").get<uint16_t>());
-        p.peerId    = jp.at("id").get<std::string>();
-        p.last_seen = Clock::now();
-        node_list_candidates_.push_back(p);
-    }
-    std::cout << "[NODE_LIST] received " << node_list_candidates_.size() << " candidates\n";
-    for (const auto& p : node_list_candidates_)
-        std::cout << "  " << p.peerId << " @ " << p.ep.address() << ":" << p.ep.port() << "\n";
-
-    if (!pending_circuit_dst_.empty()) {
-        NodeId dst = pending_circuit_dst_;
-        pending_circuit_dst_.clear();
-        begin_circuit_build(dst);
-    }
-}
-
-void Node::begin_circuit_build(const NodeId& dst, int num_relays) {
-    // dst must never appear as a relay — it would corrupt circuit_hop_table_ when used twice
-    auto& cands = node_list_candidates_;
-    cands.erase(std::remove_if(cands.begin(), cands.end(),
-        [&](const PeerInfo& p) { return p.peerId == dst; }), cands.end());
-
-    if (cands.empty()) {
-        std::cerr << "[CIRCUIT] no relay candidates available (all were dst). Run 'circuit' again.\n";
+void Node::begin_circuit_build(const NodeId& dst) {
+    // Scale relays with graph size: each relay needs a distinct node (src + relays + dst)
+    const int num_relays = std::clamp(static_cast<int>(clients_map_.size()) - 2, MIN_RELAYS, MAX_RELAYS);
+    std::cout << "[CIRCUIT] graph_size=" << clients_map_.size() << " relays=" << num_relays << "\n";
+    auto path_opt = compute_route(node_id_, dst, num_relays + 1);
+    if (!path_opt) {
+        std::cerr << "[CIRCUIT] compute_route failed - graph may be too small or dst unreachable.\n";
         return;
     }
 
-    // Prefer a directly-connected node as the first relay to skip hole-punching
-    auto connected_it = std::find_if(cands.begin(), cands.end(),
-        [&](const PeerInfo& p) { return linked_up_.contains(p.peerId); });
-    if (connected_it != cands.end() && connected_it != cands.begin())
-        std::swap(*connected_it, cands[0]);
+    // path = [src, relay1, ..., dst]; circuit path excludes src
+    std::vector<NodeId> circuit_path(path_opt->begin() + 1, path_opt->end());
 
-    const int n = static_cast<int>(cands.size());
+    if (circuit_path.empty()) {
+        std::cerr << "[CIRCUIT] computed path is empty.\n";
+        return;
+    }
 
     Circuit c;
-    c.circuit_id = proto::random_tx_id();
-
-    // Build relay list; cycles through candidates if num_relays > n.
-    // Only constraint: no two consecutive hops are the same node.
-    for (int i = 0; i < num_relays; ++i) {
-        const NodeId& prev = c.path.empty() ? NodeId{} : c.path.back();
-        for (int j = 0; j < n; ++j) {
-            const NodeId& cand = node_list_candidates_[(i + j) % n].peerId;
-            if (cand != prev) {
-                c.path.push_back(cand);
-                break;
-            }
-        }
-    }
-    // Ensure the last relay != dst before appending dst
-    if (!c.path.empty() && c.path.back() == dst) {
-        for (int j = 0; j < n; ++j) {
-            const NodeId& cand = node_list_candidates_[j % n].peerId;
-            if (cand != dst) {
-                c.path.push_back(cand);
-                break;
-            }
-        }
-    }
-    c.path.push_back(dst);
+    c.circuit_id    = proto::random_tx_id();
+    c.path          = std::move(circuit_path);
     c.hops_confirmed = 0;
 
     std::cout << "[CIRCUIT " << c.circuit_id << "] planned path: " << node_id_;
@@ -1234,16 +1208,15 @@ void Node::begin_circuit_build(const NodeId& dst, int num_relays) {
     const bool relay1_connected = linked_up_.contains(c.path[0]);
     c.state = relay1_connected ? CircuitState::EXTENDING : CircuitState::PUNCHING_ENTRY;
     circuits_[c.circuit_id] = c;
-    circuit_by_dst_[dst] = c.circuit_id;
+    circuit_by_dst_[dst]    = c.circuit_id;
 
     if (relay1_connected) {
         std::cout << "[CIRCUIT " << c.circuit_id << "] relay1 " << c.path[0]
-                  << " already connected — skipping punch, extending directly\n";
+                  << " already connected - skipping punch, extending directly\n";
         send_next_extend(circuits_[c.circuit_id]);
     } else {
-        // Ask root to introduce src <-> relay1; both will punch each other simultaneously
         request_introduce(c.path[0]);
-        std::cout << "[CIRCUIT " << c.circuit_id << "] building — asked root to introduce src <-> " << c.path[0] << "\n";
+        std::cout << "[CIRCUIT " << c.circuit_id << "] building - asked root to introduce src <-> " << c.path[0] << "\n";
     }
 }
 
@@ -1253,7 +1226,7 @@ void Node::send_next_extend(Circuit& c) {
     // hops_confirmed == path.size()-1 means every consecutive pair is connected
     if (c.hops_confirmed == static_cast<int>(c.path.size()) - 1) {
         c.state = CircuitState::READY;
-        std::cout << "[CIRCUIT " << c.circuit_id << "] READY — path: " << node_id_;
+        std::cout << "[CIRCUIT " << c.circuit_id << "] READY - path: " << node_id_;
         for (const auto& hop : c.path) std::cout << " -> " << hop;
         std::cout << "\n";
         std::cout << "[CIRCUIT " << c.circuit_id << "] use 'sanon "
@@ -1344,7 +1317,7 @@ void Node::on_circuit_extended(const udp::endpoint& from, const proto::Envelope&
         std::cout << "[CIRCUIT " << circuit_id << "] hops_confirmed=" << c.hops_confirmed << "\n";
         if (c.hops_confirmed == static_cast<int>(c.path.size()) - 1) {
             c.state = CircuitState::READY;
-            std::cout << "[CIRCUIT " << circuit_id << "] READY — path: " << node_id_;
+            std::cout << "[CIRCUIT " << circuit_id << "] READY - path: " << node_id_;
             for (const auto& hop : c.path) std::cout << " -> " << hop;
             std::cout << "\n";
             std::cout << "[CIRCUIT " << circuit_id << "] use 'sanon " << c.path.back() << " <message>'\n";
@@ -1500,7 +1473,6 @@ std::optional<std::vector<NodeId>> Node::compute_route(
     const NodeId& dst,
     int min_hops) const
 {
-    if (!is_root_) return std::nullopt;
     if (min_hops < 0) min_hops = 0;
 
     // Step A: shortest path with no restrictions
@@ -1523,7 +1495,7 @@ std::optional<std::vector<NodeId>> Node::compute_route(
     std::mt19937 rng(rd());
 
     // Safety: you can't have a simple path longer than N-1 edges.
-    // This isn't a "max hops" feature—it's a graph reality constraint.
+    // This isn't a "max hops" feature-it's a graph reality constraint.
     const int N = static_cast<int>(clients_map_.size());
     const int max_possible_simple_hops = std::max(0, N - 1);
     if (min_hops > max_possible_simple_hops) {

@@ -20,7 +20,7 @@ add_executable(trojan_message
         network/headers/apiComm.h
         network/headers/networkSettings.h
         network/headers/Node.h
-        network/headers/msg.h
+        network/headers/Msg.h
         network/source/Node.cpp
         network/source/Node.cpp
 )

@@ -62,11 +62,10 @@ enum class MsgType {
     ROUTE_RESP,
     REQ_CONNS,
     REQ_CONNS_ACK,
-    NODE_LIST_REQ,
-    NODE_LIST_RESP,
     CIRCUIT_EXTEND,
     CIRCUIT_EXTENDED,
-    INTRODUCE_REQ
+    INTRODUCE_REQ,
+    GRAPH_UPDATE
 };
 
 struct OnionLayer {
@@ -94,11 +93,10 @@ inline std::string to_string(const MsgType t) {
         case MsgType::ROUTE_RESP:        return "ROUTE_RESP";
         case MsgType::REQ_CONNS:        return "REQ_CONNS";
         case MsgType::REQ_CONNS_ACK:    return "REQ_CONNS_ACK";
-        case MsgType::NODE_LIST_REQ:    return "NODE_LIST_REQ";
-        case MsgType::NODE_LIST_RESP:   return "NODE_LIST_RESP";
         case MsgType::CIRCUIT_EXTEND:   return "CIRCUIT_EXTEND";
         case MsgType::CIRCUIT_EXTENDED: return "CIRCUIT_EXTENDED";
         case MsgType::INTRODUCE_REQ:    return "INTRODUCE_REQ";
+        case MsgType::GRAPH_UPDATE:     return "GRAPH_UPDATE";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -123,11 +121,10 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "ROUTE_RESP") return MsgType::ROUTE_RESP;
     if (s == "REQ_CONNS") return MsgType::REQ_CONNS;
     if (s == "REQ_CONNS_ACK") return MsgType::REQ_CONNS_ACK;
-    if (s == "NODE_LIST_REQ") return MsgType::NODE_LIST_REQ;
-    if (s == "NODE_LIST_RESP") return MsgType::NODE_LIST_RESP;
     if (s == "CIRCUIT_EXTEND") return MsgType::CIRCUIT_EXTEND;
     if (s == "CIRCUIT_EXTENDED") return MsgType::CIRCUIT_EXTENDED;
     if (s == "INTRODUCE_REQ")   return MsgType::INTRODUCE_REQ;
+    if (s == "GRAPH_UPDATE")    return MsgType::GRAPH_UPDATE;
     return std::nullopt;
 }
 
@@ -369,7 +366,7 @@ inline json msg_register_ack(const std::string& tx,
     std::string you_ip = you.address().to_string();
     uint16_t you_port = you.port();
     std::vector<json> peersJ;
-    for (auto peer : peers) {
+    for (const auto& peer : peers) {
         json peerJ;
         peerJ["id"] = peer.peerId;
         peerJ["ip"] = peer.ep.address().to_string();
@@ -506,25 +503,6 @@ inline json msg_data_b64(const std::string& node_id, const std::string& to_id,
     return make_envelope(MsgType::DATA, node_id, random_tx_id(), body);
 }
 
-inline json msg_node_list_req(const NodeId& node_id, int want = 4) {
-    json body;
-    body["want"] = want;
-    return make_envelope(MsgType::NODE_LIST_REQ, node_id, random_tx_id(), body);
-}
-
-inline json msg_node_list_resp(const std::string& tx, const std::vector<PeerInfo>& peers) {
-    json body;
-    std::vector<json> peersJ;
-    for (const auto& p : peers) {
-        json pj;
-        pj["id"]   = p.peerId;
-        pj["ip"]   = p.ep.address().to_string();
-        pj["port"] = p.ep.port();
-        peersJ.push_back(pj);
-    }
-    body["peers"] = peersJ;
-    return make_envelope(MsgType::NODE_LIST_RESP, "ROOT", tx, body);
-}
 
 inline json msg_circuit_extend(const NodeId& src,
                                const std::string& circuit_id,
@@ -539,6 +517,21 @@ inline json msg_introduce_req(const NodeId& src, const NodeId& target_id) {
     json body;
     body["target_id"] = target_id;
     return make_envelope(MsgType::INTRODUCE_REQ, src, random_tx_id(), body);
+}
+
+// node: the node being described; neighbors: its current neighbor IDs (no IPs)
+inline json msg_graph_update(const NodeId& src,
+                              const NodeId& node,
+                              const std::unordered_set<NodeId>& neighbors,
+                              uint64_t seq,
+                              bool initial = false) {
+    json body;
+    body["node"]    = node;
+    body["seq"]     = seq;
+    body["initial"] = initial;
+    body["neighbors"] = json::array();
+    for (const auto& n : neighbors) body["neighbors"].push_back(n);
+    return make_envelope(MsgType::GRAPH_UPDATE, src, random_tx_id(), body);
 }
 
 inline json msg_circuit_extended(const NodeId& src,
