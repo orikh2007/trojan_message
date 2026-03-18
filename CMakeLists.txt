@@ -22,7 +22,7 @@ add_executable(trojan_message
         network/headers/Node.h
         network/headers/Msg.h
         network/source/Node.cpp
-        network/source/Node.cpp
+        network/headers/log.h
 )
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 

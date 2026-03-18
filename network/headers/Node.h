@@ -7,6 +7,7 @@
 #include "Msg.h"
 #include "networkSettings.h"
 #include "apiComm.h"
+#include "log.h"
 #include <queue>
 constexpr uint32_t attempt_budget = 200;
 constexpr auto expiration_time_sec = std::chrono::seconds(45);
@@ -42,13 +43,12 @@ struct TokenEntry {
     std::chrono::steady_clock::time_point expires;
 };
 
-enum class CircuitState { PUNCHING_ENTRY, EXTENDING, READY, FAILED };
+enum class CircuitState { READY, FAILED };
 
 struct Circuit {
     std::string circuit_id;
     std::vector<NodeId> path;   // [relay1, relay2, ..., dst]  (excludes src)
-    int hops_confirmed = 0;     // how many CIRCUIT_EXTENDED confirmations received
-    CircuitState state = CircuitState::PUNCHING_ENTRY;
+    CircuitState state = CircuitState::READY;
 };
 
 
@@ -175,13 +175,9 @@ private:
     void broadcast_graph_update(const NodeId &node);  // root only
     void send_graph_snapshot(const udp::endpoint &to); // root only
 
-    void on_circuit_extend(const udp::endpoint &from, const proto::Envelope &env);   // relay
-    void on_circuit_extended(const udp::endpoint &from, const proto::Envelope &env); // src + relay
-
     void request_introduce(const NodeId &target_id);  // send INTRODUCE_REQ to root (or handle locally if we are root)
 
     void begin_circuit_build(const NodeId &dst);
-    void send_next_extend(Circuit &c);
     void send_via_circuit(const std::string &circuit_id, const std::string &data);
 
 // ------------------------ routing logic ------------------------
@@ -237,9 +233,9 @@ private:
     std::unordered_map<std::string, Circuit> circuits_;           // circuit_id → Circuit
     std::unordered_map<NodeId, std::string>  circuit_by_dst_;    // dst_id → circuit_id
 
-    // onion routing — relay side
-    std::unordered_map<std::string, NodeId> circuit_hop_table_;        // circuit_id → prev_hop_id
-    std::unordered_map<NodeId, std::string> pending_extend_circuits_;  // next_peer_id → circuit_id
+    // onion routing — relay side (populated when reverse routing is implemented)
+    std::unordered_map<std::string, NodeId> circuit_hop_table_;  // circuit_id → prev_hop_id
+
 
 
 };

@@ -62,8 +62,6 @@ enum class MsgType {
     ROUTE_RESP,
     REQ_CONNS,
     REQ_CONNS_ACK,
-    CIRCUIT_EXTEND,
-    CIRCUIT_EXTENDED,
     INTRODUCE_REQ,
     GRAPH_UPDATE
 };
@@ -93,8 +91,6 @@ inline std::string to_string(const MsgType t) {
         case MsgType::ROUTE_RESP:        return "ROUTE_RESP";
         case MsgType::REQ_CONNS:        return "REQ_CONNS";
         case MsgType::REQ_CONNS_ACK:    return "REQ_CONNS_ACK";
-        case MsgType::CIRCUIT_EXTEND:   return "CIRCUIT_EXTEND";
-        case MsgType::CIRCUIT_EXTENDED: return "CIRCUIT_EXTENDED";
         case MsgType::INTRODUCE_REQ:    return "INTRODUCE_REQ";
         case MsgType::GRAPH_UPDATE:     return "GRAPH_UPDATE";
         default: return "UNKNOWN";
@@ -121,8 +117,6 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "ROUTE_RESP") return MsgType::ROUTE_RESP;
     if (s == "REQ_CONNS") return MsgType::REQ_CONNS;
     if (s == "REQ_CONNS_ACK") return MsgType::REQ_CONNS_ACK;
-    if (s == "CIRCUIT_EXTEND") return MsgType::CIRCUIT_EXTEND;
-    if (s == "CIRCUIT_EXTENDED") return MsgType::CIRCUIT_EXTENDED;
     if (s == "INTRODUCE_REQ")   return MsgType::INTRODUCE_REQ;
     if (s == "GRAPH_UPDATE")    return MsgType::GRAPH_UPDATE;
     return std::nullopt;
@@ -504,14 +498,6 @@ inline json msg_data_b64(const std::string& node_id, const std::string& to_id,
 }
 
 
-inline json msg_circuit_extend(const NodeId& src,
-                               const std::string& circuit_id,
-                               const NodeId& next_id) {
-    json body;
-    body["circuit_id"] = circuit_id;
-    body["next_id"]    = next_id;
-    return make_envelope(MsgType::CIRCUIT_EXTEND, src, random_tx_id(), body);
-}
 
 inline json msg_introduce_req(const NodeId& src, const NodeId& target_id) {
     json body;
@@ -534,16 +520,6 @@ inline json msg_graph_update(const NodeId& src,
     return make_envelope(MsgType::GRAPH_UPDATE, src, random_tx_id(), body);
 }
 
-inline json msg_circuit_extended(const NodeId& src,
-                                 const std::string& circuit_id,
-                                 const NodeId& next_id,
-                                 bool success) {
-    json body;
-    body["circuit_id"] = circuit_id;
-    body["next_id"]    = next_id;
-    body["success"]    = success;
-    return make_envelope(MsgType::CIRCUIT_EXTENDED, src, random_tx_id(), body);
-}
 
 inline json msg_error(const std::string& tx, std::string code, std::string detail) {
     json body;

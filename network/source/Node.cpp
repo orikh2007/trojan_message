@@ -20,12 +20,14 @@ Node::Node(const uint16_t listen_port)
       cur_connections_(0),
       prune_timer_(io_),
       clients_map_() {
-    std::cout << "starting node init" << std::endl;
+    log_debug("Node init started");
     std::error_code ec;
+
+    Logger::get().set_level(LogLevel::DEBUG);
 
     node_id_ = proto::random_node_id_hex();
 
-    std::cout << "Node ID: " << node_id_ << "\n";
+    log_info("Node ID: {}", node_id_);
 
     socket_.open(udp::v4(), ec);
     if (ec) {
@@ -38,13 +40,13 @@ Node::Node(const uint16_t listen_port)
         io_.stop();
         throw std::runtime_error("socket_.bind failed (port in use?): " + ec.message());
     }
-    std::cout << "Listening on UDP IPv4 port " << listen_port << "\n";
+    log_info("Listening on UDP port {}", listen_port);
 } //constructor
 
 void Node::start() {
     recv_ = true;
     start_receive();
-    std::cout << "starting pruner" << std::endl;
+    log_debug("Starting pruner");
     start_pruner();
 } //start the receiving io "loop"
 
@@ -83,12 +85,12 @@ void Node::rebind() {
 
         // 3) open + bind new port
         self->socket_.open(udp::v4(), ec);
-        if (ec) { std::cerr << "open failed: " << ec.message() << "\n"; return; }
+        if (ec) { log_error("Socket reopen failed: {}", ec.message()); return; }
 
         self->socket_.bind(udp::endpoint(udp::v4(), self->port_), ec);
-        if (ec) { std::cerr << "bind failed: " << ec.message() << "\n"; return; }
+        if (ec) { log_error("Socket rebind failed: {}", ec.message()); return; }
 
-        std::cout << "Rebound to UDP port " << self->port_ << "\n";
+        log_info("Rebound to UDP port {}", self->port_);
 
         self->prune_timer_.cancel(ec);
         // 4) re-arm receive
@@ -107,7 +109,7 @@ void Node::handle_command(const std::string& line) {
     // quit
     try {
         if (line == "quit") {
-            std::cout << "Stopping...\n";
+            log_info("Stopping...");
             io_.stop();
             return;
         }
@@ -129,10 +131,10 @@ void Node::handle_command(const std::string& line) {
         } else if (cmd == "circuit") {
             NodeId dst;
             iss >> dst;
-            if (dst.empty()) { std::cout << "Usage: circuit <dst_id>\n"; }
+            if (dst.empty()) { log_info("Usage: circuit <dst_id>"); }
             else {
                 if (static_cast<int>(clients_map_.size()) < MIN_GRAPH_SIZE) {
-                    std::cerr << "Graph not populated yet - wait for GRAPH_UPDATE broadcasts.\n";
+                    log_warn("Graph not populated yet - wait for GRAPH_UPDATE broadcasts");
                 } else {
                     begin_circuit_build(dst);
                 }
@@ -143,25 +145,25 @@ void Node::handle_command(const std::string& line) {
             iss >> dst;
             std::getline(iss, msg);
             if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
-            if (dst.empty() || msg.empty()) { std::cout << "Usage: sanon <dst_id> <message>\n"; }
+            if (dst.empty() || msg.empty()) { log_info("Usage: sanon <dst_id> <message>"); }
             else {
                 auto it = circuit_by_dst_.find(dst);
-                if (it == circuit_by_dst_.end()) std::cerr << "No ready circuit to " << dst << ". Run 'circuit " << dst << "' first.\n";
+                if (it == circuit_by_dst_.end()) log_warn("No ready circuit to {}. Run 'circuit {}' first.", dst, dst);
                 else send_via_circuit(it->second, msg);
             }
         } else {
-            std::cout   << "Commands:\n"
-                        << "  send <peer_id> <message>\n"
-                        << "  register\n"
-                        << "  root\n"
-                        << "  circuit <dst_id>     - build onion circuit to dst\n"
-                        << "  sanon <dst_id> <msg> - send anonymously via circuit\n"
-                        << "  quit\n";
+            std::cout << "Commands:\n"
+                      << "  send <peer_id> <message>\n"
+                      << "  register\n"
+                      << "  root\n"
+                      << "  circuit <dst_id>     - build onion circuit to dst\n"
+                      << "  sanon <dst_id> <msg> - send anonymously via circuit\n"
+                      << "  quit\n";
         }
     } catch (const std::exception& e) {
         io_.stop();
         // Never let exceptions escape into asio handlers
-        std::cerr << "handle_command exception: " << e.what() << "\n";
+        log_error("handle_command exception: {}", e.what());
     }
 
 } //handle the cli command - temporary
@@ -170,14 +172,14 @@ void Node::handle_link(std::istringstream& iss) {
     NodeId to_id;
     iss >> to_id;
     if (to_id.empty()) {
-        std::cout << "Usage: link <peer_id>\n";
+        log_info("Usage: link <peer_id>");
         return;
     }
     try {
         auto& p = *connections_.at(to_id);
         link_up(to_id);
     } catch (std::exception& e) {
-        std::cerr << "Linking up failed: " << e.what() << std::endl;
+        log_error("Link up failed: {}", e.what());
     }
 }
 
@@ -187,7 +189,7 @@ void Node::handle_send(std::istringstream& iss) {
     iss >> to_id;
 
     if (to_id.empty()) {
-        std::cout << "Usage: send <to_id> <message>\n";
+        log_info("Usage: send <to_id> <message>");
         return;
     }
     try {
@@ -198,7 +200,7 @@ void Node::handle_send(std::istringstream& iss) {
     std::getline(iss, msg);
     if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
 
-    std::cout << to_id << ", " << p.ep.address().to_string() << ", " << p.ep.port() << ", " << std::endl;
+    log_debug("Sending to {} at {}:{}", to_id, p.ep.address().to_string(), p.ep.port());
 
     std::random_device rd;
     std::mt19937_64 gen(rd());
@@ -211,9 +213,9 @@ void Node::handle_send(std::istringstream& iss) {
     auto data = proto::dump_compact(j);
 
     send_text(tgt_ep, data);
-    std::cout << "Sent (async) to " << tgt_ep.address().to_string() << ":" << tgt_ep.port() << "\n";
+    log_info("Sent DATA to {}:{}", tgt_ep.address().to_string(), tgt_ep.port());
     } catch (std::exception e) {
-        std::cerr << "Exception trying to send msg: " << e.what() <<std::endl;
+        log_error("Exception sending message: {}", e.what());
     }
 } //send someone a message - temporary
 
@@ -225,7 +227,7 @@ void Node::handle_register() {
     const auto addr = asio::ip::make_address(root_ip_, ec);
     if (ec) {
         io_.stop();
-        std::cout << "Bad IP address: " << root_ip_ << " (" << ec.message() << ")\n";
+        log_error("Bad root IP address: {} ({})", root_ip_, ec.message());
         return;
     }
     const udp::endpoint ep(addr, ROOT_PORT);
@@ -233,7 +235,7 @@ void Node::handle_register() {
     root_ep_ = ep;
 
     send_text(root_ep_, data);
-    std::cout << "Sent (async) to " << root_ip_ << ":" << ROOT_PORT << "\n";
+    log_info("Sent REGISTER to {}:{}", root_ip_, ROOT_PORT);
 } //register with the root - send it node id and open port
 
 void Node::request_conns() {
@@ -241,7 +243,7 @@ void Node::request_conns() {
     const auto data = proto::dump_compact(j);
     std::error_code ec;
     send_text(root_ep_, data);
-    std::cout << "Sent root req_conns" << "\n";
+    log_debug("Sent REQ_CONNS to root");
 }
 
 void Node::handle_dis() {
@@ -277,14 +279,14 @@ void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, cons
     const udp::endpoint registeringCli = curP.ep;
     const auto dataNew = proto::dump_compact(jNew); //reg_ack data for newcomer
     send_text(registeringCli, dataNew);
-    std::cout << "Sent reg_ack to " << registeringCli.address().to_string() << ":" << registeringCli.port() << std::endl;
+    log_info("Sent REGISTER_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
 
     for (auto membr : peers){
         const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
         auto epMembr = membr.ep;
         const auto dataMembr = proto::dump_compact(jMembr);
         send_text(epMembr, dataMembr);
-        std::cout << "Sent introduce msg to " << epMembr.address().to_string() << ":" << epMembr.port() << std::endl;
+        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
     }
 
 } /* for root - handles register_ack -
@@ -307,15 +309,11 @@ void Node::broadcast(const std::string& msg) {
 }
 
 void Node::start_punch(const PeerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
-    std::cout << "Trying to punch: " << p.ep.address().to_string() << std::endl;
+    log_debug("[PUNCH] Starting punch to {} at {}:{}", p.peerId, p.ep.address().to_string(), p.ep.port());
     auto& slot = connections_[p.peerId];
     slot = std::make_unique<Connection>(io_, p.ep, tkn);
     slot->tries = 0;
     slot->connected = false;
-
-    std::cout << "[START_PUNCH] peerId=" << p.peerId
-              << " ep=" << p.ep.address().to_string() << ":" << p.ep.port()
-              << " token=" << tkn << "\n";
 
     punch(p.peerId, timeout, punch_ms);
 }
@@ -334,7 +332,7 @@ void Node::punch(const std::string& peerId, const int timeout, const int punch_m
 
 
     if (a.tries >= 8) {
-        std::cerr << "failed punching " << a.ep.address().to_string() << ":" << a.ep.port() << ":(" << std::endl;
+        log_warn("[PUNCH] Failed to reach {}:{} after {} attempts", a.ep.address().to_string(), a.ep.port(), a.tries);
         connections_.erase(it);
         return;
     }
@@ -342,7 +340,7 @@ void Node::punch(const std::string& peerId, const int timeout, const int punch_m
     std::mt19937_64 gen(rd());
     uint64_t x = gen();
     auto jitt = x%10;
-    std::cout << "JITTER " << jitt << std::endl;
+    log_debug("[PUNCH] Retry {} to {}:{} (jitter {}ms)", a.tries, a.ep.address().to_string(), a.ep.port(), jitt);
     a.timer.expires_after(std::chrono::milliseconds(punch_ms) + std::chrono::milliseconds(10 * a.tries) + std::chrono::milliseconds(jitt));
     a.timer.async_wait([self = shared_from_this(), peerId, timeout, punch_ms](const std::error_code& ec){
         if (ec) return;
@@ -357,10 +355,10 @@ void Node::send_text(const udp::endpoint& target, std::string text) {
         target,
         [self = shared_from_this(), data, target](const std::error_code& ec, std::size_t bytes) {
             if (ec){
-                std::cerr << "send error: " << ec.message() << " " << target.address().to_string() << " " << target.port() << ": " << proto::to_string(proto::parse_envelope(*data).type) << "\n";
+                log_error("Send error to {}:{}: {}", target.address().to_string(), target.port(), ec.message());
             }
             else {
-                std::cout << "SEND to " << target.address().to_string() << ":" << target.port() << ": " << data.get() << std::endl;
+                log_debug("SEND -> {}:{}", target.address().to_string(), target.port());
             }
     });
 } //sends string text to target.
@@ -381,7 +379,7 @@ void Node::on_receive(const std::error_code& ec, std::size_t n) {
             // This happens when we close/cancel the socket on purpose.
             return;
         }
-        std::cerr << "recv error: " << ec.message() << " w/ " << n << " bytes\n";
+        log_error("Receive error: {} ({} bytes)", ec.message(), n);
         if (!io_.stopped()) start_receive();
         return;
     }
@@ -401,17 +399,15 @@ void Node::on_receive(const std::error_code& ec, std::size_t n) {
 void Node::process_receive(udp::endpoint& from, const std::string &msg) {
     try {
         const proto::Envelope env = proto::parse_envelope(msg);
-        std::cout << "RECV from " << from.address().to_string() << ":" << from.port() << " | Type: " << proto::to_string(env.type) << std::endl;
+        log_debug("RECV from {}:{} | type={}", from.address().to_string(), from.port(), proto::to_string(env.type));
         dispatch(from, env);
     } catch (const std::exception& e) {
-        std::cerr << "Bad message from "
-                  << from.address().to_string() << ":" << from.port()
-                  << " : " << e.what() << "\n";
+        log_warn("Bad message from {}:{}: {}", from.address().to_string(), from.port(), e.what());
     }
 } //processes receive - unwraps the envelope and sends it to process_msg
 
 void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
-    std::cout << "processing message" << std::endl;
+    log_debug("Dispatch: {}", proto::to_string(env.type));
     switch (env.type) {
         case MsgType::REGISTER:
             on_register(from, env);
@@ -459,23 +455,17 @@ void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
         case MsgType::GRAPH_UPDATE:
             on_graph_update(from, env);
             break;
-        case MsgType::CIRCUIT_EXTEND:
-            on_circuit_extend(from, env);
-            break;
-        case MsgType::CIRCUIT_EXTENDED:
-            on_circuit_extended(from, env);
-            break;
         case MsgType::INTRODUCE_REQ:
             on_introduce_req(from, env);
             break;
         default:
-            std::cerr << "Message type cannot be processed: " << static_cast<int>(env.type) << std::endl;
+            log_warn("Unhandled message type: {}", static_cast<int>(env.type));
     }
 } //dispatches funcs according to message type
 
 void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) { //root function
     if (!is_root_) {
-        std::cerr << "I'M GROOT (NOT ROOT, DONT REGISTER HERE!)";
+        log_error("Received REGISTER but not root - ignoring (src: {})", env.src);
         return;
     }
     try {
@@ -483,20 +473,18 @@ void Node::on_register(const udp::endpoint& from, const proto::Envelope& env) { 
         p.ep = from;
         p.last_seen = Clock::now();
         p.peerId = env.src;
-        std::cout << "K: " << env.src << " T: " << p.peerId << std::endl;
         clients_map_[env.src] = p;
 
         int want = env.body.at("want_peers").get<int>();
 
         std::string tx = env.tx;
 
-        std::cout   << "peer " << env.src << " registered\n";
-        std::cout   << "here's his info: " << clients_map_[p.peerId].ep.address() << ":" << clients_map_[env.src].ep.port() << std::endl;
+        log_info("Peer {} registered from {}:{}", env.src, from.address().to_string(), from.port());
 
         handle_register_ack(tx, p, want);
         send_graph_snapshot(from);
     } catch (const std::exception& e) {
-        std::cerr << "Bad register message from " << from.address().to_string() << ": " << e.what();
+        log_error("Bad REGISTER from {}: {}", from.address().to_string(), e.what());
     }
 } //for root - processes registration requests.
 
@@ -536,21 +524,21 @@ void Node::on_req_conns(const udp::endpoint& from, const proto::Envelope& env) {
     const udp::endpoint registeringCli = curP.ep;
     const auto dataNew = proto::dump_compact(jNew); //reg_ack data for newcomer
     send_text(registeringCli, dataNew);
-    std::cout << "Sent req_conn_ack to " << registeringCli.address().to_string() << ":" << registeringCli.port() << std::endl;
+    log_info("Sent REQ_CONNS_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
 
     for (auto membr : peers){
         const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
         auto epMembr = membr.ep;
         const auto dataMembr = proto::dump_compact(jMembr);
         send_text(epMembr, dataMembr);
-        std::cout << "Sent introduce msg to " << epMembr.address().to_string() << ":" << epMembr.port() << std::endl;
+        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
     }
 }
 
 void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env) {
     try {
         if (env.src != "ROOT" || from.address().to_string() != root_ip_)
-            std::cerr << "Received reg_ack from not-root: " << env.src << " data: " << env.body << std::endl;
+            log_warn("REGISTER_ACK from unexpected source: {} (body: {})", env.src, env.body.dump());
 
         json body = env.body;
 
@@ -569,7 +557,7 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
                 p.tkn = jp.at("token").get<std::string>();
                 peers.push_back(p);
             } else {
-                std::cerr << "Peer's address: " << jp.at("ip") << ", couldn't be used" << ec.message() << std::endl;
+                log_warn("Invalid peer address {}: {}", jp.at("ip").dump(), ec.message());
             }
         }
 
@@ -582,18 +570,18 @@ void Node::on_register_ack(const udp::endpoint& from, const proto::Envelope& env
 
         for (const auto& p : peers) {
             remember_token(p.peerId, p.tkn, 6000);
-            std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
+            log_debug("Punching {}:{}", p.ep.address().to_string(), p.ep.port());
             start_punch(p, timeout, punch_ms, p.tkn);
         }
     } catch (const std::exception& e) {
-        std::cerr << "Exception while registering register_ack: " << e.what() << std::endl;
+        log_error("REGISTER_ACK handler exception: {}", e.what());
     }
 }
 
 void Node::on_req_conns_ack(const udp::endpoint& from, const proto::Envelope& env) {
     try {
         if (env.src != "ROOT" || from.address().to_string() != root_ip_)
-            std::cerr << "Received req_conns_ack from not-root: " << env.src << " data: " << env.body << std::endl;
+            log_warn("REQ_CONNS_ACK from unexpected source: {} (body: {})", env.src, env.body.dump());
 
         json body = env.body;
 
@@ -612,7 +600,7 @@ void Node::on_req_conns_ack(const udp::endpoint& from, const proto::Envelope& en
                 p.tkn = jp.at("token").get<std::string>();
                 peers.push_back(p);
             } else {
-                std::cerr << "Peer's address: " << jp.at("ip") << ", couldn't be used" << ec.message() << std::endl;
+                log_warn("Invalid peer address {}: {}", jp.at("ip").dump(), ec.message());
             }
         }
 
@@ -625,11 +613,11 @@ void Node::on_req_conns_ack(const udp::endpoint& from, const proto::Envelope& en
 
         for (const auto& p : peers) {
             remember_token(p.peerId, p.tkn, 6000);
-            std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
+            log_debug("Punching {}:{}", p.ep.address().to_string(), p.ep.port());
             start_punch(p, timeout, punch_ms, p.tkn);
         }
     } catch (const std::exception& e) {
-        std::cerr << "Exception while registering req_conns_ack: " << e.what() << std::endl;
+        log_error("REQ_CONNS_ACK handler exception: {}", e.what());
     }
 }
 
@@ -650,7 +638,7 @@ void Node::prune_tokens() {
 
 void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     if (env.src != "ROOT")
-        std::cerr << "Received introduce from not-root: " << env.src << " data: " << env.body << std::endl;
+        log_warn("INTRODUCE from unexpected source: {} (body: {})", env.src, env.body.dump());
 
     const json& body = env.body;
 
@@ -667,7 +655,7 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     std::error_code ec;
     auto pAddr = asio::ip::make_address(pIp, ec);
     if (ec) {
-        std::cerr << "Bad address from " << from.address().to_string() << std::endl;
+        log_error("INTRODUCE has invalid peer IP {} (from {}): {}", pIp, from.address().to_string(), ec.message());
         return;
     }
 
@@ -675,7 +663,7 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
 
     PeerInfo p(udp::endpoint(pAddr, pPort), peer_id, tkn);
 
-    std::cout << "Trying to punch: " << p.ep.address().to_string() << ":" << p.ep.port() << std::endl;
+    log_debug("Punching {}:{} (INTRODUCE)", p.ep.address().to_string(), p.ep.port());
 
     start_punch(p, timeout, punch_ms, tkn);
 }
@@ -731,7 +719,7 @@ void Node::on_punch(const udp::endpoint& from, const proto::Envelope& env) {
     }
 
     if (!token_is_known(tkn, from, senderId)) {
-        std::cerr << "Ignoring punch with unknown token\n";
+        log_warn("Ignoring PUNCH with unknown token from {}", senderId);
         return;
     }
 
@@ -762,37 +750,9 @@ void Node::on_punch_ack(const udp::endpoint& from, const proto::Envelope& env) {
 
     link_up(env.src);
 
-    std::cout << "Success! connected to: " << senderId << " on " << from.address().to_string() << ":" << from.port() << ". Now connected to: " << cur_connections_ << std::endl;
+    log_info("Connected to {} at {}:{} (total: {})", senderId, from.address().to_string(), from.port(), cur_connections_);
     choose_parent();
 
-    // Relay side: was this punch for a circuit extension?
-    if (auto ext_it = pending_extend_circuits_.find(senderId); ext_it != pending_extend_circuits_.end()) {
-        const std::string cid = ext_it->second;
-        pending_extend_circuits_.erase(ext_it);
-
-        const auto hop_it = circuit_hop_table_.find(cid);
-        if (hop_it != circuit_hop_table_.end()) {
-            const NodeId& return_to = hop_it->second;
-            const auto conn_it = connections_.find(return_to);
-            if (conn_it != connections_.end() && conn_it->second) {
-                const std::string ext_json = proto::dump_compact(
-                    proto::msg_circuit_extended(node_id_, cid, senderId, true));
-                const proto::OnionLayer reply{ "", proto::b64_encode(proto::to_bytes(ext_json)) };
-                const std::string layer_json = proto::onion_layer_to_json(reply).dump(-1);
-                const std::string hop_payload = proto::b64_encode(proto::to_bytes(layer_json));
-                const json hop = proto::msg_hop(hop_payload, node_id_);
-                send_text(conn_it->second->ep, proto::dump_compact(hop));
-                std::cout << "[RELAY] sent CIRCUIT_EXTENDED for circuit " << cid << "\n";
-            }
-        }
-    }
-
-    // Source side: was relay1 just connected for a pending circuit?
-    for (auto& [cid, c] : circuits_) {
-        if (c.state == CircuitState::PUNCHING_ENTRY && !c.path.empty() && c.path[0] == senderId) {
-            send_next_extend(c);
-        }
-    }
 }
 
 void Node::choose_parent() {
@@ -814,7 +774,7 @@ void Node::choose_parent() {
     }
     daddy_ = minLevelId;
     level_ = minLevel + 1;
-    std::cout << "DADDY: " << daddy_ << " MIN LEVEL: " << minLevel << std::endl;
+    log_debug("DADDY: {} (level {})", daddy_, minLevel);
 }
 
 void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
@@ -825,9 +785,9 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
     if (connections_.contains(env.src))
         connections_[env.src]->last_seen = Clock::now();
     else {
-        std::cerr << "Got data from unknown sender" << std::endl;
+        log_warn("DATA from unknown sender: {}", env.src);
     }
-    std::cout << "Got DATA from: " << env.src << " saying: " << msg << std::endl;
+    log_info("DATA from {}: {}", env.src, msg);
 }
 
 void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
@@ -835,21 +795,21 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
 
     // HOP.body["payload"] is always b64(OnionLayer_json)
     auto decoded = proto::b64_decode(raw_payload);
-    if (!decoded) { std::cerr << "on_hop: b64_decode failed\n"; return; }
+    if (!decoded) { log_error("[HOP] Outer b64_decode failed"); return; }
 
     std::string layer_json(decoded->begin(), decoded->end());
     proto::OnionLayer layer;
     try {
         layer = proto::onion_layer_from_json(json::parse(layer_json));
     } catch (const std::exception& e) {
-        std::cerr << "on_hop: bad OnionLayer: " << e.what() << "\n";
+        log_error("[HOP] Bad OnionLayer: {}", e.what());
         return;
     }
 
     if (layer.next_id.empty()) {
         // Terminal - deliver here
         auto inner = proto::b64_decode(layer.payload);
-        if (!inner) { std::cerr << "on_hop: inner b64_decode failed\n"; return; }
+        if (!inner) { log_error("[HOP] Inner b64_decode failed"); return; }
         std::string inner_str(inner->begin(), inner->end());
 
         // Try to re-dispatch as a control message (CIRCUIT_EXTEND / CIRCUIT_EXTENDED)
@@ -857,14 +817,14 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
             proto::Envelope inner_env = proto::parse_envelope(inner_str);
             dispatch(const_cast<udp::endpoint&>(from), inner_env);
         } catch (...) {
-            // Raw application data
-            std::cout << "[HOP] delivered: " << inner_str << "\n";
+            // Raw application data delivered to this node
+            log_info("[HOP] Delivered: {}", inner_str);
         }
     } else {
         // Relay - forward payload to next hop (layer.payload is already b64 of next layer)
         auto it = connections_.find(layer.next_id);
         if (it == connections_.end() || !it->second || !it->second->connected) {
-            std::cerr << "on_hop: no connection to " << layer.next_id << "\n";
+            log_warn("[HOP] No connection to next hop: {}", layer.next_id);
             return;
         }
         auto fwd = proto::msg_hop(layer.payload, node_id_);
@@ -886,7 +846,7 @@ void Node::broadcast_graph_update(const NodeId& node) { // root only
     for (const auto& [id, conn] : connections_) {
         if (conn && conn->connected) send_text(conn->ep, data);
     }
-    std::cout << "[ROOT] broadcast GRAPH_UPDATE for " << node << " seq=" << seq << "\n";
+    log_debug("[ROOT] Broadcast GRAPH_UPDATE for {} seq={}", node, seq);
 }
 
 void Node::send_graph_snapshot(const udp::endpoint& to) { // root only
@@ -895,8 +855,7 @@ void Node::send_graph_snapshot(const udp::endpoint& to) { // root only
         const json msg = proto::msg_graph_update(node_id_, id, entry.neighbors, seq, true);
         send_text(to, proto::dump_compact(msg));
     }
-    std::cout << "[ROOT] sent graph snapshot (" << clients_map_.size() << " nodes) to "
-              << to.address() << ":" << to.port() << "\n";
+    log_info("[ROOT] Sent graph snapshot ({} nodes) to {}:{}", clients_map_.size(), to.address().to_string(), to.port());
 }
 
 void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env) {
@@ -915,8 +874,7 @@ void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env
     entry.neighbors.clear();
     for (const auto& n : neigh_arr) entry.neighbors.insert(n.get<std::string>());
 
-    std::cout << "[GRAPH] updated " << node << " neighbors=" << entry.neighbors.size()
-              << " seq=" << seq << "\n";
+    log_info("[GRAPH] Updated {} neighbors={} seq={}", node, entry.neighbors.size(), seq);
 
     // Initial snapshot messages are point-to-point from root - don't re-flood
     if (initial) return;
@@ -932,7 +890,7 @@ void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env
     // Node has no more connections — remove it from local graph
     if (entry.neighbors.empty() && node != node_id_) {
         clients_map_.erase(node);
-        std::cout << "[GRAPH] removed " << node << " (no neighbors)\n";
+        log_debug("[GRAPH] Removed {} (no neighbors)", node);
     }
 }
 
@@ -942,10 +900,8 @@ void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) { //
     const NodeId neigh = env.body.at("peer").get<NodeId>();
     clients_map_[src].neighbors.insert(neigh);
     clients_map_[neigh].neighbors.insert(src);
-    std::cout << "[ROOT GRAPH] " << src << " <-> " << neigh
-          << " | deg(src)=" << clients_map_[src].neighbors.size()
-          << " deg(neigh)=" << clients_map_[neigh].neighbors.size()
-          << "\n";
+    log_info("[ROOT] Link up: {} <-> {} (deg={}, {})", src, neigh,
+             clients_map_[src].neighbors.size(), clients_map_[neigh].neighbors.size());
     broadcast_graph_update(src);
     broadcast_graph_update(neigh);
     if (neigh == node_id_) broadcast_graph_update(node_id_);
@@ -980,9 +936,8 @@ void Node::on_keepalive(const udp::endpoint& from, const proto::Envelope& env) {
     auto it = connections_.find(env.src);
     if (it != connections_.end() && it->second) {
         it->second->last_seen = Clock::now();
-        std::cout << level_ << std::endl;
     } else {
-        std::cerr << "KEEPALIVE from unknown/untracked " << env.src << "\n";
+        log_warn("KEEPALIVE from unknown/untracked: {}", env.src);
     }
 }
 
@@ -1010,7 +965,7 @@ void Node::keep_alive(const std::string& peerId) {
     prune_dead();
     auto it = connections_.find(peerId);
     if (it == connections_.end() || !it->second) {
-        std::cerr << "tried to keep_alive with a non-existing connection" << std::endl;
+        log_error("keep_alive called for unknown peer: {}", peerId);
         return;
     }
     Connection& conn = *it->second;
@@ -1019,7 +974,7 @@ void Node::keep_alive(const std::string& peerId) {
     json j = proto::msg_keepalive(node_id_);
     auto data = proto::dump_compact(j);
 
-    std::cout << "sent keep alive to: " << ep.address().to_string() << std::endl;
+    log_debug("Sent KEEPALIVE to {}", ep.address().to_string());
 
     send_text(ep, data);
 
@@ -1027,7 +982,7 @@ void Node::keep_alive(const std::string& peerId) {
     conn.ka_timer.async_wait([self = shared_from_this(), peerId](const std::error_code ec) {
         if (ec == asio::error::operation_aborted) return;
         if (ec) {
-            std::cerr << "ka_timer async wait failed: " << ec.message() << std::endl;
+            log_error("KA timer error for {}: {}", peerId, ec.message());
             return;
         }
         self->keep_alive(peerId);
@@ -1039,7 +994,7 @@ void Node::prune_tick() {
     prune_timer_.async_wait([self = shared_from_this()](const std::error_code& ec) {
         if (ec == asio::error::operation_aborted) return; // canceled on shutdown/rebind
         if (ec) {
-            std::cerr << "prune_timer error: " << ec.message() << "\n";
+            log_error("Prune timer error: {}", ec.message());
             return;
         }
 
@@ -1060,13 +1015,14 @@ void Node::prune_dead() {
         }
     }
     for (const auto& id : dead) {
-        std::cout << id << " is dead :(\n";
+        log_warn("Peer {} expired - disconnecting", id);
         dynamic_disconnect(id);
     }
 }
 
 void Node::print_graph() { //root function
     std::cout << "\n==========  GRAPH  ==========\n";
+    std::cout << "\nLevel: " << level_ << "\n";
     std::cout << "nodes: " << clients_map_.size() << "\n";
 
     // Per-node summary
@@ -1098,7 +1054,7 @@ void Node::print_graph() { //root function
 
 void Node::prune_connections() {
     if (cur_connections_ >= MAX_CONNS) {
-        std::cout << "too many connections " << cur_connections_ << " - disconnecting from someone" << std::endl;
+        log_info("Connection limit reached ({}) - dropping one peer", cur_connections_);
         rand_disconnect();
     }
 }
@@ -1146,7 +1102,7 @@ void Node::remove_connection(const NodeId& peerId) {
 
     link_down(peerId);
 
-    std::cout << "Removed " << peerId << " As I got a new connections or because I've been disconnected from." << std::endl;
+    log_info("Removed peer {} (disconnected or replaced)", peerId);
 }
 
 
@@ -1171,7 +1127,7 @@ void Node::on_introduce_req(const udp::endpoint& from, const proto::Envelope& en
     auto req_it = clients_map_.find(requester_id);
     auto tgt_it = clients_map_.find(target_id);
     if (req_it == clients_map_.end() || tgt_it == clients_map_.end()) {
-        std::cerr << "[ROOT] INTRODUCE_REQ: unknown peer " << target_id << "\n";
+        log_warn("[ROOT] INTRODUCE_REQ for unknown peer: {}", target_id);
         return;
     }
 
@@ -1189,16 +1145,16 @@ void Node::on_introduce_req(const udp::endpoint& from, const proto::Envelope& en
     const json intro_to_tgt = proto::msg_introduce(req_peer, token);
     send_text(tgt_peer.ep, proto::dump_compact(intro_to_tgt));
 
-    std::cout << "[ROOT] introduced " << requester_id << " <-> " << target_id << "\n";
+    log_info("[ROOT] Introduced {} <-> {}", requester_id, target_id);
 }
 
 void Node::begin_circuit_build(const NodeId& dst) {
     // Scale relays with graph size: each relay needs a distinct node (src + relays + dst)
     const int num_relays = std::clamp(static_cast<int>(clients_map_.size()) - 2, MIN_RELAYS, MAX_RELAYS);
-    std::cout << "[CIRCUIT] graph_size=" << clients_map_.size() << " relays=" << num_relays << "\n";
+    log_info("[CIRCUIT] Building circuit to {} (graph_size={}, relays={})", dst, clients_map_.size(), num_relays);
     auto path_opt = compute_route(node_id_, dst, num_relays + 1);
     if (!path_opt) {
-        std::cerr << "[CIRCUIT] compute_route failed - graph may be too small or dst unreachable.\n";
+        log_warn("[CIRCUIT] compute_route failed - graph too small or {} unreachable", dst);
         return;
     }
 
@@ -1206,76 +1162,28 @@ void Node::begin_circuit_build(const NodeId& dst) {
     std::vector<NodeId> circuit_path(path_opt->begin() + 1, path_opt->end());
 
     if (circuit_path.empty()) {
-        std::cerr << "[CIRCUIT] computed path is empty.\n";
+        log_warn("[CIRCUIT] Computed path is empty");
         return;
     }
 
     Circuit c;
-    c.circuit_id    = proto::random_tx_id();
-    c.path          = std::move(circuit_path);
-    c.hops_confirmed = 0;
-
-    std::cout << "[CIRCUIT " << c.circuit_id << "] planned path: " << node_id_;
-    for (const auto& hop : c.path) std::cout << " -> " << hop;
-    std::cout << "\n";
-
-    const bool relay1_connected = linked_up_.contains(c.path[0]);
-    c.state = relay1_connected ? CircuitState::EXTENDING : CircuitState::PUNCHING_ENTRY;
+    c.circuit_id = proto::random_tx_id();
+    c.path       = std::move(circuit_path);
+    c.state      = CircuitState::READY;  // all nodes already connected via DHT
     circuits_[c.circuit_id] = c;
     circuit_by_dst_[dst]    = c.circuit_id;
 
-    if (relay1_connected) {
-        std::cout << "[CIRCUIT " << c.circuit_id << "] relay1 " << c.path[0]
-                  << " already connected - skipping punch, extending directly\n";
-        send_next_extend(circuits_[c.circuit_id]);
-    } else {
-        request_introduce(c.path[0]);
-        std::cout << "[CIRCUIT " << c.circuit_id << "] building - asked root to introduce src <-> " << c.path[0] << "\n";
-    }
+    std::string path_str = node_id_;
+    for (const auto& hop : c.path) path_str += " -> " + hop;
+    log_info("[CIRCUIT {}] READY - path: {}", c.circuit_id, path_str);
+    log_info("[CIRCUIT {}] Use: sanon {} <message>", c.circuit_id, c.path.back());
 }
 
-void Node::send_next_extend(Circuit& c) {
-    c.state = CircuitState::EXTENDING;
-
-    // hops_confirmed == path.size()-1 means every consecutive pair is connected
-    if (c.hops_confirmed == static_cast<int>(c.path.size()) - 1) {
-        c.state = CircuitState::READY;
-        std::cout << "[CIRCUIT " << c.circuit_id << "] READY - path: " << node_id_;
-        for (const auto& hop : c.path) std::cout << " -> " << hop;
-        std::cout << "\n";
-        std::cout << "[CIRCUIT " << c.circuit_id << "] use 'sanon "
-                  << c.path.back() << " <message>'\n";
-        return;
-    }
-
-    // next_id is the node the current tail relay must connect to
-    const NodeId& next_id = c.path[c.hops_confirmed + 1];
-    const json extend_env = proto::msg_circuit_extend(node_id_, c.circuit_id, next_id);
-    const std::string extend_json = proto::dump_compact(extend_env);
-
-    // Wrap in hops_confirmed onion layers to travel through the partial circuit
-    // Innermost layer: {next_id:"", payload:b64(CIRCUIT_EXTEND_json)}  → delivered to tail relay
-    proto::OnionLayer inner{ "", proto::b64_encode(proto::to_bytes(extend_json)) };
-    std::string current = proto::onion_layer_to_json(inner).dump(-1);
-
-    // Add forwarding layers for each intermediate relay (if hops_confirmed > 0)
-    for (int i = c.hops_confirmed - 1; i >= 0; --i) {
-        proto::OnionLayer wrap{ c.path[i + 1], proto::b64_encode(proto::to_bytes(current)) };
-        current = proto::onion_layer_to_json(wrap).dump(-1);
-    }
-
-    // current is now the outermost OnionLayer_json; b64-encode for HOP payload
-    std::string hop_payload = proto::b64_encode(proto::to_bytes(current));
-    const json hop = proto::msg_hop(hop_payload, node_id_);
-    send_text(connections_.at(c.path[0])->ep, proto::dump_compact(hop));
-
-    std::cout << "[CIRCUIT " << c.circuit_id << "] sent CIRCUIT_EXTEND to relay tail (hops=" << c.hops_confirmed << ")\n";
-}
 
 void Node::send_via_circuit(const std::string& circuit_id, const std::string& data) {
     auto it = circuits_.find(circuit_id);
     if (it == circuits_.end() || it->second.state != CircuitState::READY) {
-        std::cerr << "[CIRCUIT] " << circuit_id << " not found or not READY\n";
+        log_warn("[CIRCUIT] {} not found or not READY", circuit_id);
         return;
     }
     const Circuit& c = it->second;
@@ -1285,79 +1193,9 @@ void Node::send_via_circuit(const std::string& circuit_id, const std::string& da
     const std::string hop_payload = proto::b64_encode(proto::to_bytes(onion_json));
     const json hop = proto::msg_hop(hop_payload, node_id_);
     send_text(connections_.at(c.path[0])->ep, proto::dump_compact(hop));
-    std::cout << "[CIRCUIT " << circuit_id << "] sent data via circuit\n";
+    log_debug("[CIRCUIT {}] Sent data via circuit", circuit_id);
 }
 
-void Node::on_circuit_extend(const udp::endpoint& from, const proto::Envelope& env) {
-    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
-    const NodeId next_id         = env.body.at("next_id").get<std::string>();
-
-    // Find the immediate predecessor by matching the `from` endpoint to a known connection.
-    // This is the node we'll reply to with CIRCUIT_EXTENDED (it may differ from env.src
-    // which is the original circuit creator, not the forwarding relay).
-    NodeId prev_hop_id;
-    for (const auto& [id, conn] : connections_) {
-        if (conn && conn->ep == from) { prev_hop_id = id; break; }
-    }
-    if (prev_hop_id.empty()) {
-        std::cerr << "[CIRCUIT_EXTEND] can't find prev hop for " << from.address() << "\n";
-        return;
-    }
-
-    circuit_hop_table_[circuit_id]     = prev_hop_id;
-    pending_extend_circuits_[next_id]  = circuit_id;
-
-    // Ask root to introduce this relay <-> next_id; both will punch simultaneously
-    request_introduce(next_id);
-
-    std::cout << "[RELAY] CIRCUIT_EXTEND: asked root to introduce me <-> " << next_id
-              << " for circuit " << circuit_id << "\n";
-}
-
-void Node::on_circuit_extended(const udp::endpoint& from, const proto::Envelope& env) {
-    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
-    const NodeId next_id         = env.body.at("next_id").get<std::string>();
-    const bool success           = env.body.at("success").get<bool>();
-
-    // Am I the circuit initiator?
-    if (auto it = circuits_.find(circuit_id); it != circuits_.end()) {
-        Circuit& c = it->second;
-        if (!success) {
-            c.state = CircuitState::FAILED;
-            std::cerr << "[CIRCUIT " << circuit_id << "] extension to " << next_id << " FAILED\n";
-            return;
-        }
-        c.hops_confirmed++;
-        std::cout << "[CIRCUIT " << circuit_id << "] hops_confirmed=" << c.hops_confirmed << "\n";
-        if (c.hops_confirmed == static_cast<int>(c.path.size()) - 1) {
-            c.state = CircuitState::READY;
-            std::cout << "[CIRCUIT " << circuit_id << "] READY - path: " << node_id_;
-            for (const auto& hop : c.path) std::cout << " -> " << hop;
-            std::cout << "\n";
-            std::cout << "[CIRCUIT " << circuit_id << "] use 'sanon " << c.path.back() << " <message>'\n";
-        } else {
-            send_next_extend(c);
-        }
-        return;
-    }
-
-    // Am I a relay? Forward CIRCUIT_EXTENDED back toward the initiator.
-    if (auto it = circuit_hop_table_.find(circuit_id); it != circuit_hop_table_.end()) {
-        const NodeId& return_to = it->second;
-        auto conn_it = connections_.find(return_to);
-        if (conn_it == connections_.end() || !conn_it->second) {
-            std::cerr << "[RELAY] can't forward CIRCUIT_EXTENDED: no conn to " << return_to << "\n";
-            return;
-        }
-        const std::string ext_json = proto::dump_compact(
-            proto::msg_circuit_extended(node_id_, circuit_id, next_id, success));
-        const proto::OnionLayer reply{ "", proto::b64_encode(proto::to_bytes(ext_json)) };
-        const std::string layer_json = proto::onion_layer_to_json(reply).dump(-1);
-        const std::string hop_payload = proto::b64_encode(proto::to_bytes(layer_json));
-        const json hop = proto::msg_hop(hop_payload, node_id_);
-        send_text(conn_it->second->ep, proto::dump_compact(hop));
-    }
-}
 
 // ------------------------ routing logic ------------------------
 
@@ -1533,8 +1371,7 @@ std::optional<std::vector<NodeId>> Node::compute_route(
     }
 
     if (hops() < min_hops)
-        std::cout << "[CIRCUIT] graph topology only allows " << hops()
-                  << " hops (wanted " << min_hops << ") — using best available path\n";
+        log_warn("[CIRCUIT] Graph topology only allows {} hops (wanted {}) - using best available path", hops(), min_hops);
 
     return path;
 }
