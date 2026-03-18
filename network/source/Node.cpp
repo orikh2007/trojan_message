@@ -918,6 +918,12 @@ void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env
     std::cout << "[GRAPH] updated " << node << " neighbors=" << entry.neighbors.size()
               << " seq=" << seq << "\n";
 
+    // Node has no more connections — remove it from local graph
+    if (entry.neighbors.empty() && node != node_id_) {
+        clients_map_.erase(node);
+        std::cout << "[GRAPH] removed " << node << " (no neighbors)\n";
+    }
+
     // Initial snapshot messages are point-to-point from root - don't re-flood
     if (initial) return;
 
@@ -955,18 +961,18 @@ void Node::on_linkdown(const udp::endpoint& from, const proto::Envelope& env) { 
     if (neigh_it != clients_map_.end()) clients_map_[neigh].neighbors.erase(src);
     if (src_it   != clients_map_.end()) clients_map_[src].neighbors.erase(neigh);
 
-    // Remove node from graph if it has no more connections; otherwise broadcast updated state
+    // Broadcast updated state first, then erase locally if node has no more connections.
+    // Broadcasting before erasing ensures other nodes learn the empty-neighbor state
+    // and can prune the node from their own local graphs.
     if (auto it = clients_map_.find(neigh); it != clients_map_.end()) {
+        broadcast_graph_update(neigh);
         if (it->second.neighbors.empty() && neigh != node_id_)
             clients_map_.erase(it);
-        else
-            broadcast_graph_update(neigh);
     }
     if (auto it = clients_map_.find(src); it != clients_map_.end()) {
+        broadcast_graph_update(src);
         if (it->second.neighbors.empty() && src != node_id_)
             clients_map_.erase(it);
-        else
-            broadcast_graph_update(src);
     }
 }
 
