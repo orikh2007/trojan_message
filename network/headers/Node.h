@@ -43,7 +43,7 @@ struct TokenEntry {
     std::chrono::steady_clock::time_point expires;
 };
 
-enum class CircuitState { READY, FAILED };
+enum class CircuitState { READY, FAILED, INITIATING };
 
 struct Circuit {
     std::string circuit_id;
@@ -169,6 +169,7 @@ private:
 // ------------------------ onion routing ------------------------
 
     void on_hop(const udp::endpoint &from, const proto::Envelope &env);
+    void on_hop_reply(const udp::endpoint &from, const proto::Envelope &env);
 
     void on_introduce_req(const udp::endpoint &from, const proto::Envelope &env);  // root
     void on_graph_update(const udp::endpoint &from, const proto::Envelope &env);
@@ -179,6 +180,7 @@ private:
 
     void begin_circuit_build(const NodeId &dst);
     void send_via_circuit(const std::string &circuit_id, const std::string &data);
+    void send_reply_via_circuit(const std::string &circuit_id, const std::string &data);
 
 // ------------------------ routing logic ------------------------
 
@@ -233,8 +235,11 @@ private:
     std::unordered_map<std::string, Circuit> circuits_;           // circuit_id → Circuit
     std::unordered_map<NodeId, std::string>  circuit_by_dst_;    // dst_id → circuit_id
 
-    // onion routing — relay side (populated when reverse routing is implemented)
+    // onion routing — relay side
     std::unordered_map<std::string, NodeId> circuit_hop_table_;  // circuit_id → prev_hop_id
+
+    // onion routing — reply side (populated when a circuit probe is received)
+    std::unordered_map<NodeId, std::string> received_circuit_by_src_;  // src_node_id → circuit_id
 
 
 

@@ -56,6 +56,7 @@ enum class MsgType {
     ERROR_,
     DISCONNECT,
     HOP,
+    HOP_REPLY,
     LINK_UP,
     LINK_DOWN,
     ROUTE_REQ,
@@ -63,12 +64,13 @@ enum class MsgType {
     REQ_CONNS,
     REQ_CONNS_ACK,
     INTRODUCE_REQ,
-    GRAPH_UPDATE
+    GRAPH_UPDATE,
 };
 
 struct OnionLayer {
     std::string next_id;  // next hop NodeId; empty string = "deliver here"
     std::string payload;  // b64(inner OnionLayer JSON)  or  b64(final data)
+    bool circuit_init = false;            //if packet is circuit_init
 };
 
 inline std::string to_string(const MsgType t) {
@@ -85,6 +87,7 @@ inline std::string to_string(const MsgType t) {
         case MsgType::ERROR_:           return "ERROR";
         case MsgType::DISCONNECT:       return "DISCONNECT";
         case MsgType::HOP:              return "HOP";
+        case MsgType::HOP_REPLY:        return "HOP_REPLY";
         case MsgType::LINK_UP:          return "LINK_UP";
         case MsgType::LINK_DOWN:        return "LINK_DOWN";
         case MsgType::ROUTE_REQ:        return "ROUTE_REQ";
@@ -111,6 +114,7 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "ERROR") return MsgType::ERROR_;
     if (s == "DISCONNECT") return MsgType::DISCONNECT;
     if (s == "HOP") return MsgType::HOP;
+    if (s == "HOP_REPLY") return MsgType::HOP_REPLY;
     if (s == "LINK_UP") return MsgType::LINK_UP;
     if (s == "LINK_DOWN") return MsgType::LINK_DOWN;
     if (s == "ROUTE_REQ") return MsgType::ROUTE_REQ;
@@ -462,7 +466,8 @@ inline OnionLayer onion_layer_from_json(const json& j) {
     // path = [relay1, relay2, ..., dst]  (excludes src)
     // Returns the outermost OnionLayer as JSON — caller b64-encodes it and puts it in a HOP payload.
     // Convention: HOP.body["payload"] is always b64(OnionLayer_json).
-    inline json build_onion(const std::vector<NodeId>& path, const std::string& data) {
+
+inline json build_onion(const std::vector<NodeId>& path, const std::string& data) {
     require(!path.empty(), "onion path must not be empty");
     // Innermost layer: destination decodes b64(data)
     OnionLayer cur{ "", b64_encode(to_bytes(data)) };
@@ -474,10 +479,19 @@ inline OnionLayer onion_layer_from_json(const json& j) {
     return onion_layer_to_json(cur);
 }
 
-inline json msg_hop(std::string payload, const NodeId &src) {
+
+inline json msg_hop(std::string payload, const NodeId &src, const std::string& circuit_id = "") {
     json body;
     body["payload"] = payload;
+    if (!circuit_id.empty()) body["circuit_id"] = circuit_id;
     return make_envelope(MsgType::HOP, src, random_tx_id(), body);
+}
+
+inline json msg_hop_reply(const std::string& circuit_id, const std::string& payload, const NodeId& src) {
+    json body;
+    body["circuit_id"] = circuit_id;
+    body["payload"] = payload;
+    return make_envelope(MsgType::HOP_REPLY, src, random_tx_id(), body);
 }
 
 inline json msg_data_b64(const std::string& node_id, const std::string& to_id,

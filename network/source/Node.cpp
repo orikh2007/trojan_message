@@ -151,13 +151,27 @@ void Node::handle_command(const std::string& line) {
                 if (it == circuit_by_dst_.end()) log_warn("No ready circuit to {}. Run 'circuit {}' first.", dst, dst);
                 else send_via_circuit(it->second, msg);
             }
+        } else if (cmd == "reply") {
+            NodeId src_id;
+            std::string msg;
+            iss >> src_id;
+            std::getline(iss, msg);
+            if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
+            if (src_id.empty() || msg.empty()) { log_info("Usage: reply <src_id> <message>"); }
+            else {
+                auto it = received_circuit_by_src_.find(src_id);
+                if (it == received_circuit_by_src_.end())
+                    log_warn("No circuit from {}. Has their probe arrived yet?", src_id);
+                else send_reply_via_circuit(it->second, msg);
+            }
         } else {
             std::cout << "Commands:\n"
                       << "  send <peer_id> <message>\n"
                       << "  register\n"
                       << "  root\n"
-                      << "  circuit <dst_id>     - build onion circuit to dst\n"
-                      << "  sanon <dst_id> <msg> - send anonymously via circuit\n"
+                      << "  circuit <dst_id>          - build onion circuit to dst\n"
+                      << "  sanon <dst_id> <msg>      - send anonymously via circuit\n"
+                      << "  reply <src_id> <msg>      - reply back through a received circuit\n"
                       << "  quit\n";
         }
     } catch (const std::exception& e) {
@@ -451,6 +465,9 @@ void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
             break;
         case MsgType::HOP:
             on_hop(from, env);
+            break;
+        case MsgType::HOP_REPLY:
+            on_hop_reply(from, env);
             break;
         case MsgType::GRAPH_UPDATE:
             on_graph_update(from, env);
@@ -792,6 +809,7 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
 
 void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
     const std::string& raw_payload = env.body.at("payload").get<std::string>();
+    const std::string circuit_id = env.body.value("circuit_id", "");
 
     // HOP.body["payload"] is always b64(OnionLayer_json)
     auto decoded = proto::b64_decode(raw_payload);
@@ -806,19 +824,35 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
         return;
     }
 
+    // Record who sent this to us so HOP_REPLY can travel back
+    if (!circuit_id.empty()) circuit_hop_table_[circuit_id] = env.src;
+
     if (layer.next_id.empty()) {
         // Terminal - deliver here
         auto inner = proto::b64_decode(layer.payload);
         if (!inner) { log_error("[HOP] Inner b64_decode failed"); return; }
         std::string inner_str(inner->begin(), inner->end());
 
-        // Try to re-dispatch as a control message (CIRCUIT_EXTEND / CIRCUIT_EXTENDED)
+        // Try to re-dispatch as a control message
         try {
             proto::Envelope inner_env = proto::parse_envelope(inner_str);
             dispatch(const_cast<udp::endpoint&>(from), inner_env);
         } catch (...) {
-            // Raw application data delivered to this node
-            log_info("[HOP] Delivered: {}", inner_str);
+            // Try to parse as a circuit JSON control message
+            try {
+                const json j = json::parse(inner_str);
+                const std::string type = j.value("type", "");
+                if (type == "probe" && !circuit_id.empty()) {
+                    const NodeId sender = j.at("src").get<std::string>();
+                    received_circuit_by_src_[sender] = circuit_id;
+                    log_info("[HOP] Circuit established from {}. Reply with: reply {} <message>",
+                             sender, sender);
+                } else {
+                    log_info("[HOP] Delivered: {}", inner_str);
+                }
+            } catch (...) {
+                log_info("[HOP] Delivered: {}", inner_str);
+            }
         }
     } else {
         // Relay - forward payload to next hop (layer.payload is already b64 of next layer)
@@ -827,9 +861,57 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
             log_warn("[HOP] No connection to next hop: {}", layer.next_id);
             return;
         }
-        auto fwd = proto::msg_hop(layer.payload, node_id_);
+        auto fwd = proto::msg_hop(layer.payload, node_id_, circuit_id);
         send_text(it->second->ep, proto::dump_compact(fwd));
     }
+}
+
+void Node::on_hop_reply(const udp::endpoint& from, const proto::Envelope& env) {
+    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
+    const std::string payload_b64 = env.body.at("payload").get<std::string>();
+
+    // If we originated this circuit, deliver the reply
+    if (circuits_.count(circuit_id)) {
+        auto decoded = proto::b64_decode(payload_b64);
+        if (!decoded) { log_error("[HOP_REPLY] b64_decode failed"); return; }
+        std::string msg(decoded->begin(), decoded->end());
+        log_info("[HOP_REPLY] [circuit={}] Reply received: {}", circuit_id, msg);
+        return;
+    }
+
+    // We're a relay - forward backwards through the circuit
+    auto it = circuit_hop_table_.find(circuit_id);
+    if (it == circuit_hop_table_.end()) {
+        log_warn("[HOP_REPLY] Unknown circuit_id: {}", circuit_id);
+        return;
+    }
+    const NodeId& prev_hop = it->second;
+    auto conn_it = connections_.find(prev_hop);
+    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
+        log_warn("[HOP_REPLY] No connection to prev hop: {}", prev_hop);
+        return;
+    }
+    const json fwd = proto::msg_hop_reply(circuit_id, payload_b64, node_id_);
+    send_text(conn_it->second->ep, proto::dump_compact(fwd));
+    log_debug("[HOP_REPLY] Forwarded circuit {} back to {}", circuit_id, prev_hop);
+}
+
+void Node::send_reply_via_circuit(const std::string& circuit_id, const std::string& data) {
+    auto it = circuit_hop_table_.find(circuit_id);
+    if (it == circuit_hop_table_.end()) {
+        log_warn("[REPLY] No return path for circuit {}. Was a message received on this circuit?", circuit_id);
+        return;
+    }
+    const NodeId& prev_hop = it->second;
+    auto conn_it = connections_.find(prev_hop);
+    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
+        log_warn("[REPLY] No connection to relay {}", prev_hop);
+        return;
+    }
+    const std::string payload = proto::b64_encode(proto::to_bytes(data));
+    const json msg = proto::msg_hop_reply(circuit_id, payload, node_id_);
+    send_text(conn_it->second->ep, proto::dump_compact(msg));
+    log_info("[REPLY] Sent reply on circuit {}", circuit_id);
 }
 
 void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
@@ -1169,7 +1251,7 @@ void Node::begin_circuit_build(const NodeId& dst) {
     Circuit c;
     c.circuit_id = proto::random_tx_id();
     c.path       = std::move(circuit_path);
-    c.state      = CircuitState::READY;  // all nodes already connected via DHT
+    c.state      = CircuitState::READY;
     circuits_[c.circuit_id] = c;
     circuit_by_dst_[dst]    = c.circuit_id;
 
@@ -1177,6 +1259,16 @@ void Node::begin_circuit_build(const NodeId& dst) {
     for (const auto& hop : c.path) path_str += " -> " + hop;
     log_info("[CIRCUIT {}] READY - path: {}", c.circuit_id, path_str);
     log_info("[CIRCUIT {}] Use: sanon {} <message>", c.circuit_id, c.path.back());
+
+    // Send a probe through the circuit so relays populate their circuit_hop_table_
+    // and dst learns who to reply to.
+    const std::string probe_payload = json{{"type", "probe"}, {"src", node_id_}}.dump(-1);
+    const auto probe_onion = proto::build_onion(c.path, probe_payload);
+    const std::string probe_json = proto::dump_compact(probe_onion);
+    const std::string hop_payload = proto::b64_encode(proto::to_bytes(probe_json));
+    const json hop = proto::msg_hop(hop_payload, node_id_, c.circuit_id);
+    send_text(connections_.at(c.path[0])->ep, proto::dump_compact(hop));
+    log_debug("[CIRCUIT {}] Probe sent to populate relay tables", c.circuit_id);
 }
 
 
@@ -1189,9 +1281,9 @@ void Node::send_via_circuit(const std::string& circuit_id, const std::string& da
     const Circuit& c = it->second;
 
     const json onion = proto::build_onion(c.path, data);
-    const std::string onion_json = onion.dump(-1);
+    const std::string onion_json = proto::dump_compact(onion);
     const std::string hop_payload = proto::b64_encode(proto::to_bytes(onion_json));
-    const json hop = proto::msg_hop(hop_payload, node_id_);
+    const json hop = proto::msg_hop(hop_payload, node_id_, circuit_id);
     send_text(connections_.at(c.path[0])->ep, proto::dump_compact(hop));
     log_debug("[CIRCUIT {}] Sent data via circuit", circuit_id);
 }
