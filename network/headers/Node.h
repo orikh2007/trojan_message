@@ -9,6 +9,7 @@
 #include "apiComm.h"
 #include "log.h"
 #include <queue>
+#include <fstream>
 constexpr uint32_t attempt_budget = 200;
 constexpr auto expiration_time_sec = std::chrono::seconds(45);
 constexpr auto prune_sec = std::chrono::seconds(10);
@@ -19,9 +20,12 @@ constexpr int ROOT_PORT = 12345;
 constexpr int MIN_RELAYS = 1;
 constexpr int MAX_RELAYS = 4;
 constexpr int MIN_GRAPH_SIZE = 2; // minimum nodes in local graph to attempt circuit building
+constexpr size_t CHUNK_SIZE = 900;
 
 using udp = asio::ip::udp;
 using MsgType = proto::MsgType;
+
+
 
 struct Connection {
     int level;
@@ -51,6 +55,19 @@ struct Circuit {
     CircuitState state = CircuitState::READY;
 };
 
+struct ReceivedMsg {
+    uint32_t chunk_num; //total number of chunks
+    ContentType content_type;
+    NodeId src;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> chunks;
+};
+
+struct OutgoingTransfer {
+    NodeId dst;
+    ContentType content_type;
+    uint32_t total_chunks;
+    std::vector<std::vector<uint8_t>> chunks; // chunks[i] = raw bytes of chunk i
+};
 
 bool operator==(proto::MsgType msg, char* str);
 
@@ -140,11 +157,19 @@ private:
 
     void punch(const std::string& peerId, int timeout, int punch_ms);
 
+    void send_chunked(const NodeId &dst, std::vector<uint8_t> data, ContentType content_type);
+
     void on_linkup(const udp::endpoint &from, const proto::Envelope &env);
 
     void on_linkdown(const udp::endpoint &from, const proto::Envelope &env);
 
     void on_keepalive(const udp::endpoint &from, const proto::Envelope &env);
+
+    void on_chunk(const udp::endpoint &from, const proto::Envelope &env);
+
+    void on_chunk_ack(const udp::endpoint &from, const proto::Envelope &env);
+
+    void on_chunk_nack(const udp::endpoint &from, const proto::Envelope &env);
 
     void link_up(const NodeId &peer);
 
@@ -211,7 +236,7 @@ private:
     udp::socket socket_;
     udp::endpoint remote_;
     bool recv_;
-    std::array<char, 2048> recv_buf_{};
+    std::array<char, 8192> recv_buf_{};
 
     NodeId daddy_; // parent node
 
@@ -241,7 +266,9 @@ private:
     // onion routing — reply side (populated when a circuit probe is received)
     std::unordered_map<NodeId, std::string> received_circuit_by_src_;  // src_node_id → circuit_id
 
-
+    std::unordered_map<std::string, ReceivedMsg> incoming_msgs_;
+    std::unordered_map<std::string, OutgoingTransfer> outgoing_transfers_; // transfer_id → transfer
+    std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> chunk_timers_; // transfer_id → nack timer
 
 };
 

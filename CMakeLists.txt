@@ -23,6 +23,8 @@ add_executable(trojan_message
         network/headers/Msg.h
         network/source/Node.cpp
         network/headers/log.h
+        encryption/crypto.cpp
+        encryption/crypto.h
 )
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 
@@ -34,9 +36,11 @@ endif()
 
 find_package(CURL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(unofficial-sodium CONFIG REQUIRED)
 
 target_link_libraries(trojan_message
         PRIVATE
         CURL::libcurl
         nlohmann_json::nlohmann_json
+        unofficial-sodium::sodium
 )

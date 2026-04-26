@@ -151,6 +151,36 @@ void Node::handle_command(const std::string& line) {
                 if (it == circuit_by_dst_.end()) log_warn("No ready circuit to {}. Run 'circuit {}' first.", dst, dst);
                 else send_via_circuit(it->second, msg);
             }
+        } else if (cmd == "sendfile") {
+            NodeId dst;
+            std::string filepath;
+            iss >> dst >> filepath;
+            if (dst.empty() || filepath.empty()) {
+                log_info("Usage: sendfile <dst_id> <filepath>");
+            } else {
+                auto circuit_it = circuit_by_dst_.find(dst);
+                if (circuit_it == circuit_by_dst_.end()) {
+                    log_warn("No ready circuit to {}. Run 'circuit {}' first.", dst, dst);
+                } else {
+                    std::ifstream file(filepath, std::ios::binary);
+                    if (!file) {
+                        log_warn("Cannot open file: {}", filepath);
+                    } else {
+                        std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                                   std::istreambuf_iterator<char>());
+                        // Detect content type from extension
+                        ContentType ct = TXT;
+                        if (filepath.ends_with(".jpg") || filepath.ends_with(".jpeg") ||
+                            filepath.ends_with(".png") || filepath.ends_with(".gif"))
+                            ct = IMG;
+                        else if (filepath.ends_with(".mp4") || filepath.ends_with(".mkv") ||
+                                 filepath.ends_with(".avi") || filepath.ends_with(".mov"))
+                            ct = VID;
+                        log_info("Sending {} bytes to {} as {}", data.size(), dst, to_string(ct));
+                        send_chunked(dst, std::move(data), ct);
+                    }
+                }
+            }
         } else if (cmd == "reply") {
             NodeId src_id;
             std::string msg;
@@ -171,6 +201,7 @@ void Node::handle_command(const std::string& line) {
                       << "  root\n"
                       << "  circuit <dst_id>          - build onion circuit to dst\n"
                       << "  sanon <dst_id> <msg>      - send anonymously via circuit\n"
+                      << "  sendfile <dst_id> <path>  - send a file anonymously via circuit\n"
                       << "  reply <src_id> <msg>      - reply back through a received circuit\n"
                       << "  quit\n";
         }
@@ -362,6 +393,36 @@ void Node::punch(const std::string& peerId, const int timeout, const int punch_m
     });
 }
 
+void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentType content_type) {
+    auto transfer_id = proto::random_tx_id();
+    uint32_t total_chunks = (data.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    auto it = circuit_by_dst_.find(dst);
+    if (it == circuit_by_dst_.end()) {
+        log_warn("[CHUNK] No circuit to {}", dst);
+        return;
+    }
+    auto circuit_id = it->second;
+
+    OutgoingTransfer transfer;
+    transfer.dst          = dst;
+    transfer.content_type = content_type;
+    transfer.total_chunks = total_chunks;
+
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        size_t start = i * CHUNK_SIZE;
+        size_t end = std::min(start + CHUNK_SIZE, data.size());
+        std::vector<uint8_t> raw_chunk(data.begin() + start, data.begin() + end);
+        transfer.chunks.push_back(raw_chunk);
+
+        proto::ChunkMeta chunk{transfer_id, i, total_chunks, content_type, proto::b64_encode(raw_chunk)};
+        auto msg = proto::msg_chunk(node_id_, chunk);
+        send_via_circuit(circuit_id, proto::dump_compact(msg));
+    }
+
+    outgoing_transfers_[transfer_id] = std::move(transfer);
+    log_info("[CHUNK] Sent {} chunks for transfer {}", total_chunks, transfer_id);
+}
+
 void Node::send_text(const udp::endpoint& target, std::string text) {
     auto data = make_shared<std::string>(std::move(text));
     socket_.async_send_to(
@@ -474,6 +535,15 @@ void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
             break;
         case MsgType::INTRODUCE_REQ:
             on_introduce_req(from, env);
+            break;
+        case MsgType::CHUNK:
+            on_chunk(from, env);
+            break;
+        case MsgType::CHUNK_ACK:
+            on_chunk_ack(from, env);
+            break;
+        case MsgType::CHUNK_NACK:
+            on_chunk_nack(from, env);
             break;
         default:
             log_warn("Unhandled message type: {}", static_cast<int>(env.type));
@@ -1022,6 +1092,144 @@ void Node::on_keepalive(const udp::endpoint& from, const proto::Envelope& env) {
         log_warn("KEEPALIVE from unknown/untracked: {}", env.src);
     }
 }
+
+void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env) {
+    auto chunk_json = env.body;
+    const std::string transfer_id = chunk_json.at("transfer_id");
+    uint32_t index      = chunk_json.at("index");
+    uint32_t chunk_num  = chunk_json.at("chunk_num");
+    ContentType ct      = chunk_json.at("content_type");
+
+    auto decoded = proto::b64_decode(chunk_json.at("payload").get<std::string>());
+    if (!decoded) {
+        log_warn("[CHUNK] b64_decode failed for transfer {} chunk {}", transfer_id, index);
+        return;
+    }
+
+    auto& msg = incoming_msgs_[transfer_id];
+    msg.chunk_num    = chunk_num;
+    msg.content_type = ct;
+    msg.src          = env.src;
+    msg.chunks[index] = std::move(*decoded);
+
+    log_debug("[CHUNK] {}/{} received for transfer {}", msg.chunks.size(), chunk_num, transfer_id);
+
+    // Helper: collect missing indices and send NACK via circuit
+    auto send_nack = [this, transfer_id, &msg]() {
+        auto circuit_it = received_circuit_by_src_.find(msg.src);
+        if (circuit_it == received_circuit_by_src_.end()) {
+            log_warn("[CHUNK] Can't send NACK — no circuit from {}", msg.src);
+            return;
+        }
+        std::vector<uint32_t> missing;
+        for (uint32_t i = 0; i < msg.chunk_num; i++)
+            if (!msg.chunks.count(i)) missing.push_back(i);
+        if (missing.empty()) return;
+        log_info("[CHUNK] Sending NACK for {} missing chunks of transfer {}", missing.size(), transfer_id);
+        auto nack = proto::msg_chunk_nack(node_id_, transfer_id, missing);
+        send_reply_via_circuit(circuit_it->second, proto::dump_compact(nack));
+    };
+
+    // On first chunk arrival, start a 10-second timeout timer
+    if (!chunk_timers_.count(transfer_id)) {
+        auto timer = std::make_unique<asio::steady_timer>(io_);
+        timer->expires_after(std::chrono::seconds(10));
+        timer->async_wait(
+            [self = shared_from_this(), transfer_id](const std::error_code& ec) {
+                if (ec) return; // cancelled
+                auto it = self->incoming_msgs_.find(transfer_id);
+                if (it == self->incoming_msgs_.end()) return; // already complete
+                log_warn("[CHUNK] Transfer {} timed out — sending NACK", transfer_id);
+                auto& msg = it->second;
+                auto circuit_it = self->received_circuit_by_src_.find(msg.src);
+                if (circuit_it == self->received_circuit_by_src_.end()) return;
+                std::vector<uint32_t> missing;
+                for (uint32_t i = 0; i < msg.chunk_num; i++)
+                    if (!msg.chunks.count(i)) missing.push_back(i);
+                if (missing.empty()) return;
+                auto nack = proto::msg_chunk_nack(self->node_id_, transfer_id, missing);
+                self->send_reply_via_circuit(circuit_it->second, proto::dump_compact(nack));
+            });
+        chunk_timers_[transfer_id] = std::move(timer);
+    }
+
+    // Check if all chunks have arrived
+    if (msg.chunks.size() < chunk_num) return;
+
+    // Cancel timeout — all chunks arrived
+    if (auto it = chunk_timers_.find(transfer_id); it != chunk_timers_.end()) {
+        it->second->cancel();
+        chunk_timers_.erase(it);
+    }
+
+    // Reassemble in order
+    std::vector<uint8_t> full_data;
+    for (uint32_t i = 0; i < chunk_num; i++) {
+        auto it = msg.chunks.find(i);
+        if (it == msg.chunks.end()) {
+            log_warn("[CHUNK] Transfer {} missing chunk {} despite full count — sending NACK", transfer_id, i);
+            send_nack();
+            return;
+        }
+        full_data.insert(full_data.end(), it->second.begin(), it->second.end());
+    }
+
+    log_info("[CHUNK] Transfer {} complete: {} bytes, type={}", transfer_id, full_data.size(), to_string(ct));
+
+    // Deliver based on content type
+    if (ct == TXT) {
+        std::string text(full_data.begin(), full_data.end());
+        log_info("[MSG from {}]: {}", msg.src, text);
+    } else {
+        // TODO: save to file for IMG/VID
+        log_info("[FILE from {}]: {} bytes received", msg.src, full_data.size());
+    }
+
+    incoming_msgs_.erase(transfer_id);
+    auto chunk_ack = proto::msg_chunk_ack(node_id_, transfer_id);
+    auto circuit_it = received_circuit_by_src_.find(msg.src);
+    if (circuit_it == received_circuit_by_src_.end()) return;
+    send_reply_via_circuit(circuit_it->second, proto::dump_compact(chunk_ack));
+}
+
+void Node::on_chunk_ack(const udp::endpoint& from, const proto::Envelope& env) {
+    const std::string transfer_id = env.body.at("transfer_id");
+    outgoing_transfers_.erase(transfer_id);
+    log_info("[CHUNK] Transfer {} acked, cache freed", transfer_id);
+}
+
+void Node::on_chunk_nack(const udp::endpoint& from, const proto::Envelope& env) {
+    const std::string transfer_id = env.body.at("transfer_id");
+    std::vector<uint32_t> missing = env.body.at("missing").get<std::vector<uint32_t>>();
+
+    auto transfer_it = outgoing_transfers_.find(transfer_id);
+    if (transfer_it == outgoing_transfers_.end()) {
+        log_warn("[CHUNK_NACK] Unknown transfer {}", transfer_id);
+        return;
+    }
+
+    auto circuit_it = circuit_by_dst_.find(transfer_it->second.dst);
+    if (circuit_it == circuit_by_dst_.end()) {
+        log_warn("[CHUNK_NACK] No circuit to {} for retransmit", transfer_it->second.dst);
+        return;
+    }
+
+    log_info("[CHUNK_NACK] Retransmitting {}/{} missing chunks for transfer {}",
+             missing.size(), transfer_it->second.total_chunks, transfer_id);
+
+    const OutgoingTransfer& transfer = transfer_it->second;
+    for (uint32_t i : missing) {
+        if (i >= transfer.total_chunks) {
+            log_warn("[CHUNK_NACK] Invalid chunk index {} in retransmit request", i);
+            continue;
+        }
+        proto::ChunkMeta chunk{transfer_id, i, transfer.total_chunks,
+                               transfer.content_type, proto::b64_encode(transfer.chunks[i])};
+        auto msg = proto::msg_chunk(node_id_, chunk);
+        send_via_circuit(circuit_it->second, proto::dump_compact(msg));
+    }
+}
+
 
 void Node::link_up(const NodeId& peer) {
     if (linked_up_.contains(peer)) return;

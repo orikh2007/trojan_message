@@ -33,7 +33,20 @@ struct PeerInfo {
     }
 };
 
+enum ContentType {
+    TXT,
+    IMG,
+    VID
+};
 
+inline std::string to_string(ContentType ct) {
+    switch (ct) {
+        case TXT: return "TXT";
+        case IMG: return "IMG";
+        case VID: return "VID";
+        default:  return "UNKNOWN";
+    }
+}
 
 namespace proto {
 using json = nlohmann::json;
@@ -65,12 +78,23 @@ enum class MsgType {
     REQ_CONNS_ACK,
     INTRODUCE_REQ,
     GRAPH_UPDATE,
+    CHUNK,
+    CHUNK_ACK,
+    CHUNK_NACK //request a resend of specific chunk.
 };
 
 struct OnionLayer {
     std::string next_id;  // next hop NodeId; empty string = "deliver here"
     std::string payload;  // b64(inner OnionLayer JSON)  or  b64(final data)
     bool circuit_init = false;            //if packet is circuit_init
+};
+
+struct ChunkMeta {
+    std::string transfer_id;
+    uint32_t index;
+    uint32_t chunk_num; //amount of chunks
+    ContentType content_type; //"txt", "image", "video" etc.
+    std::string payload;
 };
 
 inline std::string to_string(const MsgType t) {
@@ -96,6 +120,9 @@ inline std::string to_string(const MsgType t) {
         case MsgType::REQ_CONNS_ACK:    return "REQ_CONNS_ACK";
         case MsgType::INTRODUCE_REQ:    return "INTRODUCE_REQ";
         case MsgType::GRAPH_UPDATE:     return "GRAPH_UPDATE";
+        case MsgType::CHUNK:     return "CHUNK";
+        case MsgType::CHUNK_ACK:     return "CHUNK_ACK";
+        case MsgType::CHUNK_NACK:     return "CHUNK_NACK";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -123,6 +150,9 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "REQ_CONNS_ACK") return MsgType::REQ_CONNS_ACK;
     if (s == "INTRODUCE_REQ")   return MsgType::INTRODUCE_REQ;
     if (s == "GRAPH_UPDATE")    return MsgType::GRAPH_UPDATE;
+    if (s == "CHUNK")    return MsgType::CHUNK;
+    if (s == "CHUNK_ACK")    return MsgType::CHUNK_ACK;
+    if (s == "CHUNK_NACK")    return MsgType::CHUNK_NACK;
     return std::nullopt;
 }
 
@@ -309,6 +339,29 @@ inline std::string dump_compact(const json& j) {
     // ---------------------------
     // Message builders
     // ---------------------------
+
+inline json msg_chunk(const NodeId& src, const ChunkMeta& chunk) {
+    json body;
+    body["transfer_id"] = chunk.transfer_id;
+    body["chunk_num"] = chunk.chunk_num;
+    body["content_type"] = chunk.content_type;
+    body["index"] = chunk.index;
+    body["payload"] = chunk.payload;
+    return make_envelope(MsgType::CHUNK, src, random_tx_id(), body);
+}
+
+inline json msg_chunk_ack(const NodeId& src, const std::string& transfer_id) {
+    json body;
+    body["transfer_id"] = transfer_id;
+    return make_envelope(MsgType::CHUNK_ACK, src, random_tx_id(), body);
+}
+
+inline json msg_chunk_nack(const NodeId& src, const std::string& transfer_id, const std::vector<uint32_t>& missing) {
+    json body;
+    body["transfer_id"] = transfer_id;
+    body["missing"] = missing;
+    return make_envelope(MsgType::CHUNK_NACK, src, random_tx_id(), body);
+}
 
 inline json msg_req_conns(const NodeId& node_id, uint16_t listen_port, int want_peers = 4) {
     json body;
