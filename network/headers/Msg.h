@@ -80,7 +80,8 @@ enum class MsgType {
     GRAPH_UPDATE,
     CHUNK,
     CHUNK_ACK,
-    CHUNK_NACK //request a resend of specific chunk.
+    CHUNK_NACK, //request a resend of specific chunk.
+    CIRCUIT_BROKEN,
 };
 
 struct OnionLayer {
@@ -120,9 +121,10 @@ inline std::string to_string(const MsgType t) {
         case MsgType::REQ_CONNS_ACK:    return "REQ_CONNS_ACK";
         case MsgType::INTRODUCE_REQ:    return "INTRODUCE_REQ";
         case MsgType::GRAPH_UPDATE:     return "GRAPH_UPDATE";
-        case MsgType::CHUNK:     return "CHUNK";
-        case MsgType::CHUNK_ACK:     return "CHUNK_ACK";
-        case MsgType::CHUNK_NACK:     return "CHUNK_NACK";
+        case MsgType::CHUNK:            return "CHUNK";
+        case MsgType::CHUNK_ACK:        return "CHUNK_ACK";
+        case MsgType::CHUNK_NACK:       return "CHUNK_NACK";
+        case MsgType::CIRCUIT_BROKEN:   return "CIRCUIT_BROKEN";
         default: return "UNKNOWN";
     }
     return "ERROR";
@@ -150,9 +152,10 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "REQ_CONNS_ACK") return MsgType::REQ_CONNS_ACK;
     if (s == "INTRODUCE_REQ")   return MsgType::INTRODUCE_REQ;
     if (s == "GRAPH_UPDATE")    return MsgType::GRAPH_UPDATE;
-    if (s == "CHUNK")    return MsgType::CHUNK;
-    if (s == "CHUNK_ACK")    return MsgType::CHUNK_ACK;
-    if (s == "CHUNK_NACK")    return MsgType::CHUNK_NACK;
+    if (s == "CHUNK")           return MsgType::CHUNK;
+    if (s == "CHUNK_ACK")       return MsgType::CHUNK_ACK;
+    if (s == "CHUNK_NACK")      return MsgType::CHUNK_NACK;
+    if (s == "CIRCUIT_BROKEN")  return MsgType::CIRCUIT_BROKEN;
     return std::nullopt;
 }
 
@@ -545,6 +548,12 @@ inline json msg_hop_reply(const std::string& circuit_id, const std::string& payl
     body["circuit_id"] = circuit_id;
     body["payload"] = payload;
     return make_envelope(MsgType::HOP_REPLY, src, random_tx_id(), body);
+}
+
+inline json msg_circuit_broken(const std::string& circuit_id, const NodeId& src) {
+    json body;
+    body["circuit_id"] = circuit_id;
+    return make_envelope(MsgType::CIRCUIT_BROKEN, src, random_tx_id(), body);
 }
 
 inline json msg_data_b64(const std::string& node_id, const std::string& to_id,

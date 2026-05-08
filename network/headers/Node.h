@@ -195,6 +195,7 @@ private:
 
     void on_hop(const udp::endpoint &from, const proto::Envelope &env);
     void on_hop_reply(const udp::endpoint &from, const proto::Envelope &env);
+    void on_circuit_broken(const udp::endpoint &from, const proto::Envelope &env);
 
     void on_introduce_req(const udp::endpoint &from, const proto::Envelope &env);  // root
     void on_graph_update(const udp::endpoint &from, const proto::Envelope &env);
@@ -204,6 +205,9 @@ private:
     void request_introduce(const NodeId &target_id);  // send INTRODUCE_REQ to root (or handle locally if we are root)
 
     void begin_circuit_build(const NodeId &dst);
+
+    void invalidate_circuits_through(const NodeId& peer_id);
+
     void send_via_circuit(const std::string &circuit_id, const std::string &data);
     void send_reply_via_circuit(const std::string &circuit_id, const std::string &data);
 
