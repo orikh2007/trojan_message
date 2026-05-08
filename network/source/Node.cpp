@@ -902,7 +902,43 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
 
     if (layer.next_id.empty()) {
         // Terminal - deliver here
-        auto inner = proto::b64_decode(layer.payload);
+        if (layer.circuit_init && !circuit_id.empty()) {
+            auto kp = crypto::gen_keypair();
+            auto secret = crypto::derive_secret(kp, layer.src_pub);
+            circuit_keys_[circuit_id] = std::vector{secret};
+            circuit_pending_kp_[circuit_id] = std::vector{kp};
+            const auto my_pub = crypto::get_pubkey(kp);
+            const std::vector<uint8_t> my_pub_vec = std::vector<uint8_t> {my_pub.begin(), my_pub.end()};
+            auto ack_payload_json = json{
+                {"type","probe_ack"},
+                {"keys",json::array({proto::b64_encode(my_pub_vec)})}}.dump(-1);
+            auto ack_b64 = proto::b64_encode(std::vector<uint8_t>(ack_payload_json.begin(), ack_payload_json.end()));
+            auto next = circuit_hop_table_[circuit_id];
+            auto ack = proto::msg_hop_reply(circuit_id, ack_b64, node_id_);
+            auto ret_it = connections_.find(next);
+            if (ret_it == connections_.end()) {
+                log_error("[DST_HOP] Cant return prob - no connection found");
+                return;
+            }
+            send_text(ret_it->second->ep, proto::dump_compact(ack));
+        }
+        std::string deliver_payload = layer.payload;
+        if (!layer.circuit_init && !circuit_id.empty()) {
+            if (auto ck_find = circuit_keys_.find(circuit_id); ck_find != circuit_keys_.end()) {
+                auto enc = proto::b64_decode(layer.payload);
+                if (!enc) {
+                    log_error("[HOP] failed to decode payload");
+                    return;
+                }
+                auto dec = crypto::decrypt(ck_find->second[0], *enc);
+                if (!dec) {
+                    log_error("[HOP] failed to decrypt payload");
+                    return;
+                }
+                deliver_payload = proto::b64_encode(*dec);
+            }
+        }
+        auto inner = proto::b64_decode(deliver_payload);
         if (!inner) { log_error("[HOP] Inner b64_decode failed"); return; }
         std::string inner_str(inner->begin(), inner->end());
 
@@ -945,21 +981,75 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
             }
             return;
         }
-        auto fwd = proto::msg_hop(layer.payload, node_id_, circuit_id);
+        if (layer.circuit_init) {
+            EVP_PKEY* kp = crypto::gen_keypair();
+            std::array<uint8_t, 32> sym_key = crypto::derive_secret(kp, layer.src_pub);
+            circuit_keys_[circuit_id] = std::vector {sym_key};
+            circuit_pending_kp_[circuit_id] = std::vector {kp};
+        }
+        std::string payload = layer.payload;
+        if (auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end() && !layer.circuit_init) {
+            auto enc_payload = proto::b64_decode(layer.payload);
+            if (!enc_payload) {
+                log_error("[HOP] Circuit payload decrypt failed");
+                return;
+            }
+            auto dec_payload = crypto::decrypt(ck_it->second[0], *enc_payload);
+            if (!dec_payload) {
+                log_error("[HOP] Circuit payload decrypt failed");
+                return;
+            }
+            payload = proto::b64_encode(*dec_payload);
+        }
+        auto fwd = proto::msg_hop(payload, node_id_, circuit_id);
         send_text(it->second->ep, proto::dump_compact(fwd));
     }
 }
 
 void Node::on_hop_reply(const udp::endpoint& from, const proto::Envelope& env) {
     const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
-    const std::string payload_b64 = env.body.at("payload").get<std::string>();
+    std::string payload_b64 = env.body.at("payload").get<std::string>();
 
     // If we originated this circuit, deliver the reply
-    if (circuits_.count(circuit_id)) {
+    if (circuits_.contains(circuit_id)) {
         auto decoded = proto::b64_decode(payload_b64);
         if (!decoded) { log_error("[HOP_REPLY] b64_decode failed"); return; }
         std::string msg(decoded->begin(), decoded->end());
-        log_info("[HOP_REPLY] [circuit={}] Reply received: {}", circuit_id, msg);
+        if (!circuit_keys_.contains(circuit_id)) {
+            auto msg_j = json::parse(msg);
+            if (msg_j.value("type", "") != "probe_ack") {
+                log_error("[HOP_REPLY] Got an unknown packet");
+                return;
+            }
+            std::vector<std::array<uint8_t, 32>> shared_keys;
+            auto& keys_json = msg_j.at("keys");
+            shared_keys.resize(keys_json.size());
+            for (size_t i = 0; i < keys_json.size(); i++) {
+                auto key_b64 = keys_json[i].get<std::string>();
+                auto key = proto::b64_decode(key_b64);
+                if (!key) {
+                    log_error("[HOP_REPLY] key b64_decode failed");
+                    return;
+                }
+                std::array<uint8_t, 32> peer_pub{};
+                std::ranges::copy(*key, peer_pub.begin());
+                auto shared_key = crypto::derive_secret(circuit_pending_kp_[circuit_id][keys_json.size() - 1 - i], peer_pub);
+                shared_keys.at(shared_keys.size() - i - 1) = shared_key;
+                crypto::free_keypair(circuit_pending_kp_[circuit_id][keys_json.size() - 1 - i]);
+            }
+            circuit_pending_kp_.erase(circuit_id);
+            circuit_keys_[circuit_id] = std::move(shared_keys);
+            log_debug("[HOP_REPLY] Circuit_id: {} has been established", circuit_id);
+            circuits_[circuit_id].state = CircuitState::READY;
+        }
+        else {
+           for (std::array<uint8_t, 32>& key : circuit_keys_[circuit_id]) {
+                decoded = crypto::decrypt(key, *decoded);
+               if (!decoded) { log_error("[HOP_REPLY] reply decrypt failed"); return; }
+           }
+            msg = std::string(decoded->begin(), decoded->end());
+            log_info("[HOP_REPLY] [circuit={}] Reply received: {}", circuit_id, msg);
+        }
         return;
     }
 
@@ -974,6 +1064,30 @@ void Node::on_hop_reply(const udp::endpoint& from, const proto::Envelope& env) {
     if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
         log_warn("[HOP_REPLY] No connection to prev hop: {}", prev_hop);
         return;
+    }
+    if (auto cpkp_it = circuit_pending_kp_.find(circuit_id); cpkp_it != circuit_pending_kp_.end()) {
+        auto payload = proto::b64_decode(payload_b64);
+        if (!payload) {
+            log_error("[HOP_REPLY] payload decode failed");
+            return;
+        }
+        std::string pl_json_str (payload->begin(), payload->end());
+        json pl_json = json::parse(pl_json_str);
+        auto keys = pl_json["keys"].get<json::array_t>();
+        auto my_pub = crypto::get_pubkey(cpkp_it->second[0]);
+        auto my_pub_vec = std::vector<uint8_t> (my_pub.begin(), my_pub.end());
+        auto my_pub_b64 = proto::b64_encode(my_pub_vec);
+        keys.push_back(my_pub_b64);
+        pl_json["keys"] = keys;
+        auto pl_str = proto::dump_compact(pl_json);
+        payload_b64 = proto::b64_encode(std::vector<uint8_t>(pl_str.begin(), pl_str.end()));
+        crypto::free_keypair(cpkp_it->second[0]);
+        circuit_pending_kp_.erase(circuit_id);
+    } else if (auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end()) {
+        auto raw = proto::b64_decode(payload_b64);
+        if (!raw) { log_error("[HOP_REPLY] relay encrypt: b64_decode failed"); return; }
+        auto enc_pl = crypto::encrypt(ck_it->second[0], *raw);
+        payload_b64 = proto::b64_encode(enc_pl);
     }
     const json fwd = proto::msg_hop_reply(circuit_id, payload_b64, node_id_);
     send_text(conn_it->second->ep, proto::dump_compact(fwd));
@@ -994,6 +1108,11 @@ void Node::on_circuit_broken(const udp::endpoint& from, const proto::Envelope& e
         it->second.state = CircuitState::INITIATING; // block duplicate CIRCUIT_BROKEN messages
         log_warn("[CIRCUIT {}] Broken in transit - rebuilding to {}", circuit_id, dst);
         circuits_.erase(it);
+        if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
+            for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+            circuit_pending_kp_.erase(kp_it);
+        }
+        circuit_keys_.erase(circuit_id);
         begin_circuit_build(dst);
         return;
     }
@@ -1026,7 +1145,10 @@ void Node::send_reply_via_circuit(const std::string& circuit_id, const std::stri
         log_warn("[REPLY] No connection to relay {}", prev_hop);
         return;
     }
-    const std::string payload = proto::b64_encode(proto::to_bytes(data));
+    std::vector<uint8_t> data_bytes = proto::to_bytes(data);
+    if (const auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end())
+        data_bytes = crypto::encrypt(ck_it->second[0], data_bytes);
+    const std::string payload = proto::b64_encode(data_bytes);
     const json msg = proto::msg_hop_reply(circuit_id, payload, node_id_);
     send_text(conn_it->second->ep, proto::dump_compact(msg));
     log_info("[REPLY] Sent reply on circuit {}", circuit_id);
@@ -1499,7 +1621,7 @@ void Node::begin_circuit_build(const NodeId& dst) {
     }
 
     // path = [src, relay1, ..., dst]; circuit path excludes src
-    std::vector<NodeId> circuit_path(path_opt->begin() + 1, path_opt->end());
+    std::vector circuit_path(path_opt->begin() + 1, path_opt->end());
 
     if (circuit_path.empty()) {
         log_warn("[CIRCUIT] Computed path is empty");
@@ -1509,7 +1631,7 @@ void Node::begin_circuit_build(const NodeId& dst) {
     Circuit c;
     c.circuit_id = proto::random_tx_id();
     c.path       = std::move(circuit_path);
-    c.state      = CircuitState::READY;
+    c.state      = CircuitState::INITIATING;
     circuits_[c.circuit_id] = c;
     circuit_by_dst_[dst]    = c.circuit_id;
 
@@ -1520,8 +1642,13 @@ void Node::begin_circuit_build(const NodeId& dst) {
 
     // Send a probe through the circuit so relays populate their circuit_hop_table_
     // and dst learns who to reply to.
-    const std::string probe_payload = json{{"type", "probe"}, {"src", node_id_}}.dump(-1);
-    const auto probe_onion = proto::build_onion(c.path, probe_payload);
+    std::vector<EVP_PKEY*> path_keypairs = gen_path_keys(c.path.size());
+    circuit_pending_kp_[c.circuit_id] = path_keypairs;
+    auto path_pubkeys = get_path_pubkeys(path_keypairs);
+    const std::string probe_payload = json{
+        {"type", "probe"},
+        {"src", node_id_}}.dump(-1);
+    const auto probe_onion = proto::build_onion(c.path, probe_payload, path_pubkeys);
     const std::string probe_json = proto::dump_compact(probe_onion);
     const std::string hop_payload = proto::b64_encode(proto::to_bytes(probe_json));
     const json hop = proto::msg_hop(hop_payload, node_id_, c.circuit_id);
@@ -1541,6 +1668,12 @@ void Node::invalidate_circuits_through(const NodeId& peer_id) {
     for (auto& [old_cid, dst] : to_rebuild) {
         log_warn("[CIRCUIT {}] Relay {} lost - rebuilding to {}", old_cid, peer_id, dst);
         circuits_.erase(old_cid);
+        if (auto kp_it = circuit_pending_kp_.find(old_cid); kp_it != circuit_pending_kp_.end()) {
+            for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+            circuit_pending_kp_.erase(kp_it);
+        }
+        circuit_keys_.erase(old_cid);
+
         begin_circuit_build(dst);
     }
 }
@@ -1559,11 +1692,19 @@ void Node::send_via_circuit(const std::string& circuit_id, const std::string& da
     if (first_hop == connections_.end() || !first_hop->second) {
         log_warn("[CIRCUIT {}] First hop {} gone - rebuilding", circuit_id, path[0]);
         circuits_.erase(it);
+        if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
+            for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+            circuit_pending_kp_.erase(kp_it);
+        }
+        circuit_keys_.erase(circuit_id);
         begin_circuit_build(dst);
         return;
     }
 
-    const json onion = proto::build_onion(path, data);
+    std::vector<std::array<uint8_t,32>> hop_keys{};
+    if (const auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end())
+        hop_keys = ck_it->second;
+    const json onion = proto::build_onion(path, data, {}, hop_keys);
     const std::string onion_json = proto::dump_compact(onion);
     const std::string hop_payload = proto::b64_encode(proto::to_bytes(onion_json));
     const json hop = proto::msg_hop(hop_payload, node_id_, circuit_id);
@@ -1571,6 +1712,26 @@ void Node::send_via_circuit(const std::string& circuit_id, const std::string& da
     log_debug("[CIRCUIT {}] Sent data via circuit", circuit_id);
 }
 
+
+// ------------------------ encryption logic ------------------------
+
+ std::vector<EVP_PKEY*> Node::gen_path_keys(const size_t hop_num) {
+    std::vector<EVP_PKEY*> path{};
+    for (size_t i = 0; i < hop_num; i++) {
+        EVP_PKEY* cur = crypto::gen_keypair();
+        path.push_back(cur);
+    }
+    return path;
+}
+
+std::vector<std::array<uint8_t, 32>> Node::get_path_pubkeys(const std::vector<EVP_PKEY*>& kps) {
+    std::vector<std::array<uint8_t, 32>> path{};
+    for (auto& kp : kps) {
+        auto cur = crypto::get_pubkey(kp);
+        path.push_back(cur);
+    }
+    return path;
+}
 
 // ------------------------ routing logic ------------------------
 

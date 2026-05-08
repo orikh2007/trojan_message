@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_set>
+#include "../../encryption/crypto.h"
 
 
 typedef std::string NodeId;
@@ -88,6 +89,7 @@ struct OnionLayer {
     std::string next_id;  // next hop NodeId; empty string = "deliver here"
     std::string payload;  // b64(inner OnionLayer JSON)  or  b64(final data)
     bool circuit_init = false;            //if packet is circuit_init
+    std::array<uint8_t, 32> src_pub{};
 };
 
 struct ChunkMeta {
@@ -127,7 +129,6 @@ inline std::string to_string(const MsgType t) {
         case MsgType::CIRCUIT_BROKEN:   return "CIRCUIT_BROKEN";
         default: return "UNKNOWN";
     }
-    return "ERROR";
 }
 
 inline std::optional<MsgType> parse_type(std::string_view s) {
@@ -512,31 +513,65 @@ inline json onion_layer_to_json(const OnionLayer& l) {
     json j;
     j["next_id"] = l.next_id;
     j["payload"] = l.payload;
+    if (l.circuit_init) {
+        j["circuit_init"] = l.circuit_init; //true
+        j["src_pub"] = b64_encode(std::vector<uint8_t>(l.src_pub.begin(), l.src_pub.end()));
+    }
     return j;
 }
 
 inline OnionLayer onion_layer_from_json(const json& j) {
-    return { j.at("next_id").get<std::string>(), j.at("payload").get<std::string>() };
+    OnionLayer l;
+    l.next_id = j.at("next_id").get<std::string>();
+    l.payload = j.at("payload").get<std::string>();
+    l.circuit_init = j.value("circuit_init", false);
+    if (l.circuit_init && j.contains("src_pub")) {
+        auto bytes = b64_decode(j.at("src_pub").get<std::string>());
+        if (bytes && bytes->size() == 32)
+            std::copy(bytes->begin(), bytes->end(), l.src_pub.begin());
+    }
+    return l;
+
 }
 
     // path = [relay1, relay2, ..., dst]  (excludes src)
     // Returns the outermost OnionLayer as JSON — caller b64-encodes it and puts it in a HOP payload.
     // Convention: HOP.body["payload"] is always b64(OnionLayer_json).
 
-inline json build_onion(const std::vector<NodeId>& path, const std::string& data) {
+inline json build_onion(const std::vector<NodeId>& path, const std::string& data,
+                        const std::vector<std::array<uint8_t, 32>>& hop_pubs = {}, const std::vector<std::array<uint8_t, 32>>& hop_keys = {}) {
     require(!path.empty(), "onion path must not be empty");
     // Innermost layer: destination decodes b64(data)
-    OnionLayer cur{ "", b64_encode(to_bytes(data)) };
+    const bool is_init = !hop_pubs.empty();
+    const bool is_encrypted = !hop_keys.empty();
+    OnionLayer cur;
+    std::vector<uint8_t> payload = to_bytes(data);
+    cur.next_id = "";
+    if (is_init) {
+        cur.circuit_init = true;
+        cur.src_pub = hop_pubs.at(path.size() - 1);
+    }
+    if (is_encrypted)
+        payload = crypto::encrypt(hop_keys.at(path.size() - 1), payload);
+    cur.payload = b64_encode(payload);
     // Wrap from second-to-last node back to first
     for (int i = static_cast<int>(path.size()) - 2; i >= 0; --i) {
-        std::string inner = onion_layer_to_json(cur).dump(-1);
-        cur = OnionLayer{ path[i + 1], b64_encode(to_bytes(inner)) };
+        std::string inner = dump_compact(onion_layer_to_json(cur));
+        payload = to_bytes(inner);
+        cur = OnionLayer{ path[i + 1], "" };
+        if (is_init) {
+            cur.circuit_init = true;
+            cur.src_pub = hop_pubs.at(i);
+        }
+        if (is_encrypted)
+            payload = crypto::encrypt(hop_keys.at(i), payload);
+        cur.payload = b64_encode(payload);
     }
     return onion_layer_to_json(cur);
 }
 
 
-inline json msg_hop(std::string payload, const NodeId &src, const std::string& circuit_id = "") {
+inline json msg_hop(const std::string& payload, const NodeId &src, const std::string& circuit_id = "") {
     json body;
     body["payload"] = payload;
     if (!circuit_id.empty()) body["circuit_id"] = circuit_id;

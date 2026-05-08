@@ -23,11 +23,11 @@ add_executable(trojan_message
         network/headers/Msg.h
         network/source/Node.cpp
         network/headers/log.h
-        encryption/crypto.cpp
-        encryption/crypto.h
-        tests/crypto_test.h
-        tests/crypto_test.cpp
+        encryption/Crypto.cpp
+        encryption/Crypto.h
 )
+
+
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 
 if (WIN32)

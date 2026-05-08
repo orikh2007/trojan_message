@@ -209,7 +209,12 @@ private:
     void invalidate_circuits_through(const NodeId& peer_id);
 
     void send_via_circuit(const std::string &circuit_id, const std::string &data);
+
     void send_reply_via_circuit(const std::string &circuit_id, const std::string &data);
+
+    std::vector<EVP_PKEY*> gen_path_keys(size_t hop_num);
+
+    std::vector<std::array<uint8_t, 32>> get_path_pubkeys(const std::vector<EVP_PKEY*>& kps);
 
 // ------------------------ routing logic ------------------------
 
@@ -274,6 +279,9 @@ private:
     std::unordered_map<std::string, OutgoingTransfer> outgoing_transfers_; // transfer_id → transfer
     std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> chunk_timers_; // transfer_id → nack timer
 
+    //CRYPTO - key maps
+    std::unordered_map<std::string, std::vector<std::array<uint8_t, 32>>> circuit_keys_; // src: [k_relay1, k_relay2, k_dst] — relay: [k_i] (just one)
+    std::unordered_map<std::string, std::vector<EVP_PKEY*>> circuit_pending_kp_; // src: [e1_kp, e2_kp, e3_kp] — relay: [r_i_kp] (just one, until probe_ack passes through)
 };
 
 #endif //TROJAN_MESSAGE_NODE_H
