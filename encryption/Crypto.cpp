@@ -90,3 +90,19 @@ std::optional<std::vector<uint8_t>> crypto::decrypt(const std::array<uint8_t,32>
     plaintext.resize(out_len + final_len);
     return plaintext;
 }
+
+std::array<uint8_t, 32> crypto::hkdf_sha256(const std::array<uint8_t, 32> &ikm, const std::string &salt, std::string_view info) {
+    uint8_t prk[32];
+    unsigned int prk_len = 32;
+    HMAC(EVP_sha256(),
+        salt.data(), static_cast<int>(salt.size()),
+        ikm.data(), 32,
+        prk, &prk_len);
+    std::vector<uint8_t> expand_input(info.begin(), info.end());
+    expand_input.push_back(0x01);
+
+    std::array<uint8_t, 32> out{};
+    unsigned int out_len = 32;
+    HMAC(EVP_sha256(), prk, 32, expand_input.data(), static_cast<int>(expand_input.size()), out.data(), &out_len);
+    return out;
+}

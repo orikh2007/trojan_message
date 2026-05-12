@@ -420,6 +420,18 @@ void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentTyp
     }
 
     outgoing_transfers_[transfer_id] = std::move(transfer);
+
+    // Sender-side timeout: if CHUNK_ACK never arrives, free the cache
+    auto xfer_timer = std::make_unique<asio::steady_timer>(io_);
+    xfer_timer->expires_after(outgoing_transfer_timeout_sec);
+    xfer_timer->async_wait([self = shared_from_this(), transfer_id](const std::error_code& ec) {
+        if (ec) return;
+        if (self->outgoing_transfers_.erase(transfer_id))
+            log_warn("[CHUNK] Transfer {} sender-timeout — cache freed", transfer_id);
+        self->outgoing_transfer_timers_.erase(transfer_id);
+    });
+    outgoing_transfer_timers_[transfer_id] = std::move(xfer_timer);
+
     log_info("[CHUNK] Sent {} chunks for transfer {}", total_chunks, transfer_id);
 }
 
@@ -904,7 +916,7 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
         // Terminal - deliver here
         if (layer.circuit_init && !circuit_id.empty()) {
             auto kp = crypto::gen_keypair();
-            auto secret = crypto::derive_secret(kp, layer.src_pub);
+            auto secret = crypto::hkdf_sha256(crypto::derive_secret(kp, layer.src_pub), circuit_id);
             circuit_keys_[circuit_id] = std::vector{secret};
             circuit_pending_kp_[circuit_id] = std::vector{kp};
             const auto my_pub = crypto::get_pubkey(kp);
@@ -953,6 +965,10 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
                 const std::string type = j.value("type", "");
                 if (type == "probe" && !circuit_id.empty()) {
                     const NodeId sender = j.at("src").get<std::string>();
+                    // Clean up the old circuit's state before registering the replacement
+                    if (auto old_it = received_circuit_by_src_.find(sender);
+                        old_it != received_circuit_by_src_.end() && old_it->second != circuit_id)
+                        cleanup_relay_circuit(old_it->second);
                     received_circuit_by_src_[sender] = circuit_id;
                     log_info("[HOP] Circuit established from {}. Reply with: reply {} <message>",
                              sender, sender);
@@ -983,7 +999,7 @@ void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
         }
         if (layer.circuit_init) {
             EVP_PKEY* kp = crypto::gen_keypair();
-            std::array<uint8_t, 32> sym_key = crypto::derive_secret(kp, layer.src_pub);
+            std::array<uint8_t, 32> sym_key = crypto::hkdf_sha256(crypto::derive_secret(kp, layer.src_pub), circuit_id);
             circuit_keys_[circuit_id] = std::vector {sym_key};
             circuit_pending_kp_[circuit_id] = std::vector {kp};
         }
@@ -1033,22 +1049,32 @@ void Node::on_hop_reply(const udp::endpoint& from, const proto::Envelope& env) {
                 }
                 std::array<uint8_t, 32> peer_pub{};
                 std::ranges::copy(*key, peer_pub.begin());
-                auto shared_key = crypto::derive_secret(circuit_pending_kp_[circuit_id][keys_json.size() - 1 - i], peer_pub);
+                auto shared_key = crypto::hkdf_sha256(crypto::derive_secret(circuit_pending_kp_[circuit_id][keys_json.size() - 1 - i], peer_pub), circuit_id);
                 shared_keys.at(shared_keys.size() - i - 1) = shared_key;
                 crypto::free_keypair(circuit_pending_kp_[circuit_id][keys_json.size() - 1 - i]);
             }
             circuit_pending_kp_.erase(circuit_id);
             circuit_keys_[circuit_id] = std::move(shared_keys);
+            cancel_circuit_timer(circuit_id);
             log_debug("[HOP_REPLY] Circuit_id: {} has been established", circuit_id);
-            circuits_[circuit_id].state = CircuitState::READY;
+            circuits_[circuit_id].state   = CircuitState::READY;
+            circuits_[circuit_id].last_ack = Clock::now();
         }
         else {
-           for (std::array<uint8_t, 32>& key : circuit_keys_[circuit_id]) {
+            for (std::array<uint8_t, 32>& key : circuit_keys_[circuit_id]) {
                 decoded = crypto::decrypt(key, *decoded);
-               if (!decoded) { log_error("[HOP_REPLY] reply decrypt failed"); return; }
-           }
+                if (!decoded) { log_error("[HOP_REPLY] reply decrypt failed"); return; }
+            }
+            if (auto c_it = circuits_.find(circuit_id); c_it != circuits_.end())
+                c_it->second.last_ack = Clock::now();
             msg = std::string(decoded->begin(), decoded->end());
-            log_info("[HOP_REPLY] [circuit={}] Reply received: {}", circuit_id, msg);
+            // Re-dispatch as a protocol message (CHUNK_ACK, CHUNK_NACK, etc.)
+            try {
+                proto::Envelope inner_env = proto::parse_envelope(msg);
+                dispatch(const_cast<udp::endpoint&>(from), inner_env);
+            } catch (...) {
+                log_info("[HOP_REPLY] [circuit={}] Reply: {}", circuit_id, msg);
+            }
         }
         return;
     }
@@ -1107,6 +1133,7 @@ void Node::on_circuit_broken(const udp::endpoint& from, const proto::Envelope& e
         const NodeId dst = it->second.path.back();
         it->second.state = CircuitState::INITIATING; // block duplicate CIRCUIT_BROKEN messages
         log_warn("[CIRCUIT {}] Broken in transit - rebuilding to {}", circuit_id, dst);
+        cancel_circuit_timer(circuit_id);
         circuits_.erase(it);
         if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
             for (auto* kp : kp_it->second) crypto::free_keypair(kp);
@@ -1126,10 +1153,12 @@ void Node::on_circuit_broken(const udp::endpoint& from, const proto::Envelope& e
     auto conn_it = connections_.find(back_it->second);
     if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
         log_warn("[CIRCUIT_BROKEN] Can't propagate - no connection to {}", back_it->second);
+        cleanup_relay_circuit(circuit_id);
         return;
     }
     const json fwd = proto::msg_circuit_broken(circuit_id, node_id_);
     send_text(conn_it->second->ep, proto::dump_compact(fwd));
+    cleanup_relay_circuit(circuit_id);
     log_debug("[CIRCUIT_BROKEN] Forwarded {} back to {}", circuit_id, back_it->second);
 }
 
@@ -1300,27 +1329,55 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env) {
         send_reply_via_circuit(circuit_it->second, proto::dump_compact(nack));
     };
 
-    // On first chunk arrival, start a 10-second timeout timer
-    if (!chunk_timers_.count(transfer_id)) {
-        auto timer = std::make_unique<asio::steady_timer>(io_);
-        timer->expires_after(std::chrono::seconds(10));
-        timer->async_wait(
-            [self = shared_from_this(), transfer_id](const std::error_code& ec) {
-                if (ec) return; // cancelled
-                auto it = self->incoming_msgs_.find(transfer_id);
-                if (it == self->incoming_msgs_.end()) return; // already complete
-                log_warn("[CHUNK] Transfer {} timed out — sending NACK", transfer_id);
-                auto& msg = it->second;
-                auto circuit_it = self->received_circuit_by_src_.find(msg.src);
-                if (circuit_it == self->received_circuit_by_src_.end()) return;
-                std::vector<uint32_t> missing;
-                for (uint32_t i = 0; i < msg.chunk_num; i++)
-                    if (!msg.chunks.count(i)) missing.push_back(i);
-                if (missing.empty()) return;
+    // On first chunk arrival, arm the recurring NACK retry timer
+    if (!chunk_timers_.contains(transfer_id)) {
+        chunk_timers_[transfer_id] = std::make_unique<asio::steady_timer>(io_);
+
+        auto retry_fn = std::make_shared<std::function<void(const std::error_code&)>>();
+        *retry_fn = [self = shared_from_this(), transfer_id, retry_fn](const std::error_code& ec) mutable {
+            if (ec) return; // cancelled — completed or timer destroyed
+
+            auto msg_it = self->incoming_msgs_.find(transfer_id);
+            if (msg_it == self->incoming_msgs_.end()) return; // already completed
+            auto& rmsg = msg_it->second;
+
+            if (rmsg.nack_retries >= MAX_NACK_RETRIES) {
+                log_warn("[CHUNK] Transfer {} gave up after {} retries — dropping", transfer_id, MAX_NACK_RETRIES);
+                self->incoming_msgs_.erase(transfer_id);
+                self->chunk_timers_.erase(transfer_id);
+                return;
+            }
+
+            auto circuit_it = self->received_circuit_by_src_.find(rmsg.src);
+            if (circuit_it == self->received_circuit_by_src_.end()) {
+                log_warn("[CHUNK] Transfer {} — no reply circuit, dropping", transfer_id);
+                self->incoming_msgs_.erase(transfer_id);
+                self->chunk_timers_.erase(transfer_id);
+                return;
+            }
+
+            std::vector<uint32_t> missing;
+            for (uint32_t i = 0; i < rmsg.chunk_num; i++)
+                if (!rmsg.chunks.count(i)) missing.push_back(i);
+
+            if (!missing.empty()) {
+                rmsg.nack_retries++;
+                log_info("[CHUNK] NACK #{} — {}/{} missing for transfer {}",
+                         rmsg.nack_retries, missing.size(), rmsg.chunk_num, transfer_id);
                 auto nack = proto::msg_chunk_nack(self->node_id_, transfer_id, missing);
                 self->send_reply_via_circuit(circuit_it->second, proto::dump_compact(nack));
-            });
-        chunk_timers_[transfer_id] = std::move(timer);
+            }
+
+            // Reschedule for next retry
+            auto t_it = self->chunk_timers_.find(transfer_id);
+            if (t_it != self->chunk_timers_.end()) {
+                t_it->second->expires_after(std::chrono::seconds(10));
+                t_it->second->async_wait(*retry_fn);
+            }
+        };
+
+        chunk_timers_[transfer_id]->expires_after(std::chrono::seconds(10));
+        chunk_timers_[transfer_id]->async_wait(*retry_fn);
     }
 
     // Check if all chunks have arrived
@@ -1365,6 +1422,10 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env) {
 void Node::on_chunk_ack(const udp::endpoint& from, const proto::Envelope& env) {
     const std::string transfer_id = env.body.at("transfer_id");
     outgoing_transfers_.erase(transfer_id);
+    if (auto it = outgoing_transfer_timers_.find(transfer_id); it != outgoing_transfer_timers_.end()) {
+        it->second->cancel();
+        outgoing_transfer_timers_.erase(it);
+    }
     log_info("[CHUNK] Transfer {} acked, cache freed", transfer_id);
 }
 
@@ -1459,8 +1520,31 @@ void Node::prune_tick() {
         }
 
         // Do the pruning work
-        self->prune_tokens();            // you already have this
-        self->prune_dead();  // implement as we discussed
+        self->prune_tokens();
+        self->prune_dead();
+
+        // Ghost circuit detection: READY circuits where a reply is overdue
+        const auto now = Clock::now();
+        std::vector<std::pair<std::string, NodeId>> ghost_circuits;
+        for (const auto& [cid, circ] : self->circuits_) {
+            if (circ.state != CircuitState::READY) continue;
+            if (circ.last_used == Clock::time_point{}) continue;  // never used
+            if (circ.last_ack >= circ.last_used) continue;        // got a reply after last send — healthy
+            if (now - circ.last_used > circuit_dead_sec)          // been waiting 30s with no reply — dead
+                ghost_circuits.emplace_back(cid, circ.path.back());
+        }
+        for (auto& [cid, dst] : ghost_circuits) {
+            log_warn("[CIRCUIT {}] No reply in {}s — presumed dead, rebuilding to {}",
+                     cid, circuit_dead_sec.count(), dst);
+            self->cancel_circuit_timer(cid);
+            if (auto kp_it = self->circuit_pending_kp_.find(cid); kp_it != self->circuit_pending_kp_.end()) {
+                for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+                self->circuit_pending_kp_.erase(kp_it);
+            }
+            self->circuit_keys_.erase(cid);
+            self->circuits_.erase(cid);
+            self->begin_circuit_build(dst);
+        }
 
         // reschedule
         self->prune_tick();
@@ -1628,6 +1712,21 @@ void Node::begin_circuit_build(const NodeId& dst) {
         return;
     }
 
+    // If there is already a stuck INITIATING circuit for this dst, clean it up first.
+    if (auto old_by_dst = circuit_by_dst_.find(dst); old_by_dst != circuit_by_dst_.end()) {
+        const std::string& old_cid = old_by_dst->second;
+        if (auto old_circ = circuits_.find(old_cid);
+            old_circ != circuits_.end() && old_circ->second.state == CircuitState::INITIATING) {
+            cancel_circuit_timer(old_cid);
+            if (auto kp_it = circuit_pending_kp_.find(old_cid); kp_it != circuit_pending_kp_.end()) {
+                for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+                circuit_pending_kp_.erase(kp_it);
+            }
+            circuit_keys_.erase(old_cid);
+            circuits_.erase(old_circ);
+        }
+    }
+
     Circuit c;
     c.circuit_id = proto::random_tx_id();
     c.path       = std::move(circuit_path);
@@ -1654,6 +1753,26 @@ void Node::begin_circuit_build(const NodeId& dst) {
     const json hop = proto::msg_hop(hop_payload, node_id_, c.circuit_id);
     send_text(connections_.at(c.path[0])->ep, proto::dump_compact(hop));
     log_debug("[CIRCUIT {}] Probe sent to populate relay tables", c.circuit_id);
+
+    // Start a timeout: if the handshake never completes, clean up and retry.
+    const std::string cid_copy = c.circuit_id;
+    auto timer = std::make_unique<asio::steady_timer>(io_);
+    timer->expires_after(circuit_init_timeout_sec);
+    timer->async_wait([self = shared_from_this(), cid_copy, dst](const std::error_code& ec) {
+        if (ec) return; // cancelled — circuit became READY or was torn down
+        auto it = self->circuits_.find(cid_copy);
+        if (it == self->circuits_.end() || it->second.state != CircuitState::INITIATING) return;
+        log_warn("[CIRCUIT {}] Handshake timed out — rebuilding to {}", cid_copy, dst);
+        if (auto kp_it = self->circuit_pending_kp_.find(cid_copy); kp_it != self->circuit_pending_kp_.end()) {
+            for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+            self->circuit_pending_kp_.erase(kp_it);
+        }
+        self->circuit_keys_.erase(cid_copy);
+        self->circuits_.erase(cid_copy);
+        self->circuit_timers_.erase(cid_copy);
+        self->begin_circuit_build(dst);
+    });
+    circuit_timers_[c.circuit_id] = std::move(timer);
 }
 
 void Node::invalidate_circuits_through(const NodeId& peer_id) {
@@ -1667,13 +1786,13 @@ void Node::invalidate_circuits_through(const NodeId& peer_id) {
     }
     for (auto& [old_cid, dst] : to_rebuild) {
         log_warn("[CIRCUIT {}] Relay {} lost - rebuilding to {}", old_cid, peer_id, dst);
+        cancel_circuit_timer(old_cid);
         circuits_.erase(old_cid);
         if (auto kp_it = circuit_pending_kp_.find(old_cid); kp_it != circuit_pending_kp_.end()) {
             for (auto* kp : kp_it->second) crypto::free_keypair(kp);
             circuit_pending_kp_.erase(kp_it);
         }
         circuit_keys_.erase(old_cid);
-
         begin_circuit_build(dst);
     }
 }
@@ -1685,12 +1804,15 @@ void Node::send_via_circuit(const std::string& circuit_id, const std::string& da
         return;
     }
 
+    it->second.last_used = Clock::now();
+
     const NodeId dst = it->second.path.back();
     const auto& path = it->second.path;
 
     auto first_hop = connections_.find(path[0]);
     if (first_hop == connections_.end() || !first_hop->second) {
         log_warn("[CIRCUIT {}] First hop {} gone - rebuilding", circuit_id, path[0]);
+        cancel_circuit_timer(circuit_id);
         circuits_.erase(it);
         if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
             for (auto* kp : kp_it->second) crypto::free_keypair(kp);
@@ -1715,7 +1837,24 @@ void Node::send_via_circuit(const std::string& circuit_id, const std::string& da
 
 // ------------------------ encryption logic ------------------------
 
- std::vector<EVP_PKEY*> Node::gen_path_keys(const size_t hop_num) {
+void Node::cancel_circuit_timer(const std::string& circuit_id) {
+    if (auto it = circuit_timers_.find(circuit_id); it != circuit_timers_.end()) {
+        it->second->cancel();
+        circuit_timers_.erase(it);
+    }
+}
+
+// Cleans up relay-side state for a circuit that has been torn down.
+void Node::cleanup_relay_circuit(const std::string& circuit_id) {
+    circuit_hop_table_.erase(circuit_id);
+    circuit_keys_.erase(circuit_id);
+    if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
+        for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+        circuit_pending_kp_.erase(kp_it);
+    }
+}
+
+std::vector<EVP_PKEY*> Node::gen_path_keys(const size_t hop_num) {
     std::vector<EVP_PKEY*> path{};
     for (size_t i = 0; i < hop_num; i++) {
         EVP_PKEY* cur = crypto::gen_keypair();

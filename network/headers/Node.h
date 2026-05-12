@@ -13,6 +13,10 @@
 constexpr uint32_t attempt_budget = 200;
 constexpr auto expiration_time_sec = std::chrono::seconds(45);
 constexpr auto prune_sec = std::chrono::seconds(10);
+constexpr auto circuit_init_timeout_sec = std::chrono::seconds(10);
+constexpr auto circuit_dead_sec         = std::chrono::seconds(30);
+constexpr uint32_t MAX_NACK_RETRIES     = 5;
+constexpr auto outgoing_transfer_timeout_sec = std::chrono::seconds(60);
 
 constexpr int MAX_CONNS = 4;
 constexpr int MIN_CONNS = 1;
@@ -53,12 +57,15 @@ struct Circuit {
     std::string circuit_id;
     std::vector<NodeId> path;   // [relay1, relay2, ..., dst]  (excludes src)
     CircuitState state = CircuitState::READY;
+    Clock::time_point last_used{};  // last time data was sent through this circuit
+    Clock::time_point last_ack{};   // last time a HOP_REPLY was received on this circuit
 };
 
 struct ReceivedMsg {
     uint32_t chunk_num; //total number of chunks
     ContentType content_type;
     NodeId src;
+    uint32_t nack_retries = 0;
     std::unordered_map<uint32_t, std::vector<uint8_t>> chunks;
 };
 
@@ -212,6 +219,10 @@ private:
 
     void send_reply_via_circuit(const std::string &circuit_id, const std::string &data);
 
+    void cancel_circuit_timer(const std::string &circuit_id);
+
+    void cleanup_relay_circuit(const std::string &circuit_id);
+
     std::vector<EVP_PKEY*> gen_path_keys(size_t hop_num);
 
     std::vector<std::array<uint8_t, 32>> get_path_pubkeys(const std::vector<EVP_PKEY*>& kps);
@@ -245,7 +256,7 @@ private:
     udp::socket socket_;
     udp::endpoint remote_;
     bool recv_;
-    std::array<char, 8192> recv_buf_{};
+    std::array<char, 16384> recv_buf_{};
 
     NodeId daddy_; // parent node
 
@@ -277,7 +288,9 @@ private:
 
     std::unordered_map<std::string, ReceivedMsg> incoming_msgs_;
     std::unordered_map<std::string, OutgoingTransfer> outgoing_transfers_; // transfer_id → transfer
-    std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> chunk_timers_; // transfer_id → nack timer
+    std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> chunk_timers_;            // transfer_id → nack retry timer
+    std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> outgoing_transfer_timers_; // transfer_id → sender timeout
+    std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> circuit_timers_;           // circuit_id  → init timeout
 
     //CRYPTO - key maps
     std::unordered_map<std::string, std::vector<std::array<uint8_t, 32>>> circuit_keys_; // src: [k_relay1, k_relay2, k_dst] — relay: [k_i] (just one)

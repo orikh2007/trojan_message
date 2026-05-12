@@ -56,6 +56,12 @@ using json = nlohmann::json;
 // Constants / Types
 // ---------------------------
 inline constexpr int PROTO_VERSION = 0xb00b;
+inline constexpr int64_t REPLAY_WINDOW_MS = 30'000; // ±30 s
+
+inline int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
 enum class MsgType {
     REGISTER,
@@ -314,6 +320,9 @@ inline Envelope parse_envelope(const std::string& text) {
     e.tx = j["tx"].get<std::string>();
     e.src = j["src"].get<std::string>();
     e.ts = j.value("ts", int64_t{0});
+    require(e.ts != 0, "missing timestamp");
+    { const int64_t drift = now_ms() - e.ts;
+      require(drift > -REPLAY_WINDOW_MS && drift < REPLAY_WINDOW_MS, "timestamp out of replay window"); }
     e.body = j["body"];
 
     // Basic sanity for node IDs (skip for ROOT)
@@ -324,13 +333,13 @@ inline Envelope parse_envelope(const std::string& text) {
     return e;
 }
 
-inline json make_envelope(MsgType type, std::string src, std::string tx, json body, int64_t ts = 0) {
+inline json make_envelope(MsgType type, std::string src, std::string tx, json body) {
     json j;
     j["v"] = PROTO_VERSION;
     j["type"] = to_string(type);
     j["tx"] = std::move(tx);
     j["src"] = std::move(src);
-    if (ts != 0) j["ts"] = ts;
+    j["ts"] = now_ms();
     j["body"] = std::move(body);
     return j;
 }
