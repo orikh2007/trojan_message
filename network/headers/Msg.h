@@ -89,12 +89,16 @@ enum class MsgType {
     CHUNK_ACK,
     CHUNK_NACK, //request a resend of specific chunk.
     CIRCUIT_BROKEN,
+    YOU_ARE_HEIR,
+    NEW_ROOT,
+    GRAPH_RESET,
 };
 
 struct OnionLayer {
-    std::string next_id;  // next hop NodeId; empty string = "deliver here"
-    std::string payload;  // b64(inner OnionLayer JSON)  or  b64(final data)
-    bool circuit_init = false;            //if packet is circuit_init
+    std::string next_id;   // next hop NodeId; empty = "deliver here"
+    std::string next_cid;  // CID to use on the next link (set during circuit_init so each hop switches CIDs)
+    std::string payload;   // b64(inner OnionLayer JSON)  or  b64(final data)
+    bool circuit_init = false;
     std::array<uint8_t, 32> src_pub{};
 };
 
@@ -133,6 +137,9 @@ inline std::string to_string(const MsgType t) {
         case MsgType::CHUNK_ACK:        return "CHUNK_ACK";
         case MsgType::CHUNK_NACK:       return "CHUNK_NACK";
         case MsgType::CIRCUIT_BROKEN:   return "CIRCUIT_BROKEN";
+        case MsgType::YOU_ARE_HEIR:     return "YOU_ARE_HEIR";
+        case MsgType::NEW_ROOT:         return "NEW_ROOT";
+        case MsgType::GRAPH_RESET:      return "GRAPH_RESET";
         default: return "UNKNOWN";
     }
 }
@@ -163,6 +170,9 @@ inline std::optional<MsgType> parse_type(std::string_view s) {
     if (s == "CHUNK_ACK")       return MsgType::CHUNK_ACK;
     if (s == "CHUNK_NACK")      return MsgType::CHUNK_NACK;
     if (s == "CIRCUIT_BROKEN")  return MsgType::CIRCUIT_BROKEN;
+    if (s == "YOU_ARE_HEIR")    return MsgType::YOU_ARE_HEIR;
+    if (s == "NEW_ROOT")        return MsgType::NEW_ROOT;
+    if (s == "GRAPH_RESET")     return MsgType::GRAPH_RESET;
     return std::nullopt;
 }
 
@@ -522,8 +532,9 @@ inline json onion_layer_to_json(const OnionLayer& l) {
     json j;
     j["next_id"] = l.next_id;
     j["payload"] = l.payload;
+    if (!l.next_cid.empty()) j["next_cid"] = l.next_cid;
     if (l.circuit_init) {
-        j["circuit_init"] = l.circuit_init; //true
+        j["circuit_init"] = l.circuit_init;
         j["src_pub"] = b64_encode(std::vector<uint8_t>(l.src_pub.begin(), l.src_pub.end()));
     }
     return j;
@@ -532,6 +543,7 @@ inline json onion_layer_to_json(const OnionLayer& l) {
 inline OnionLayer onion_layer_from_json(const json& j) {
     OnionLayer l;
     l.next_id = j.at("next_id").get<std::string>();
+    l.next_cid = j.value("next_cid", "");
     l.payload = j.at("payload").get<std::string>();
     l.circuit_init = j.value("circuit_init", false);
     if (l.circuit_init && j.contains("src_pub")) {
@@ -547,15 +559,20 @@ inline OnionLayer onion_layer_from_json(const json& j) {
     // Returns the outermost OnionLayer as JSON — caller b64-encodes it and puts it in a HOP payload.
     // Convention: HOP.body["payload"] is always b64(OnionLayer_json).
 
+// path_cids[i] = the CID that will be used on the link INTO path[i] from path[i-1] (or src for i=0).
+// path_cids must be empty or exactly path.size() elements.
 inline json build_onion(const std::vector<NodeId>& path, const std::string& data,
-                        const std::vector<std::array<uint8_t, 32>>& hop_pubs = {}, const std::vector<std::array<uint8_t, 32>>& hop_keys = {}) {
+                        const std::vector<std::array<uint8_t, 32>>& hop_pubs = {},
+                        const std::vector<std::array<uint8_t, 32>>& hop_keys = {},
+                        const std::vector<std::string>& path_cids = {}) {
     require(!path.empty(), "onion path must not be empty");
-    // Innermost layer: destination decodes b64(data)
+    require(path_cids.empty() || path_cids.size() == path.size(), "path_cids must match path length");
     const bool is_init = !hop_pubs.empty();
     const bool is_encrypted = !hop_keys.empty();
     OnionLayer cur;
     std::vector<uint8_t> payload = to_bytes(data);
     cur.next_id = "";
+    // Innermost layer: exit node — no next_cid (it doesn't forward)
     if (is_init) {
         cur.circuit_init = true;
         cur.src_pub = hop_pubs.at(path.size() - 1);
@@ -567,7 +584,11 @@ inline json build_onion(const std::vector<NodeId>& path, const std::string& data
     for (int i = static_cast<int>(path.size()) - 2; i >= 0; --i) {
         std::string inner = dump_compact(onion_layer_to_json(cur));
         payload = to_bytes(inner);
-        cur = OnionLayer{ path[i + 1], "" };
+        cur = OnionLayer{};
+        cur.next_id = path[i + 1];
+        // Embed the CID the relay at path[i] should use when forwarding to path[i+1]
+        if (is_init && !path_cids.empty())
+            cur.next_cid = path_cids[i + 1];
         if (is_init) {
             cur.circuit_init = true;
             cur.src_pub = hop_pubs.at(i);
@@ -640,6 +661,24 @@ inline json msg_graph_update(const NodeId& src,
     return make_envelope(MsgType::GRAPH_UPDATE, src, random_tx_id(), body);
 }
 
+
+inline json msg_graph_reset() {
+    return make_envelope(MsgType::GRAPH_RESET, "ROOT", random_tx_id(), json::object());
+}
+
+inline json msg_you_are_heir(const NodeId& root_id) {
+    json body;
+    body["root_id"] = root_id;
+    return make_envelope(MsgType::YOU_ARE_HEIR, root_id, random_tx_id(), body);
+}
+
+inline json msg_new_root(const NodeId& new_root_id, const std::string& new_root_ip, const NodeId& old_root_id = "") {
+    json body;
+    body["root_id"]     = new_root_id;
+    body["ip"]          = new_root_ip;
+    body["old_root_id"] = old_root_id;
+    return make_envelope(MsgType::NEW_ROOT, new_root_id, random_tx_id(), body);
+}
 
 inline json msg_error(const std::string& tx, std::string code, std::string detail) {
     json body;

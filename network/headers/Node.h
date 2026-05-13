@@ -9,6 +9,8 @@
 #include "apiComm.h"
 #include "log.h"
 #include <queue>
+#include <deque>
+#include <mutex>
 #include <fstream>
 constexpr uint32_t attempt_budget = 200;
 constexpr auto expiration_time_sec = std::chrono::seconds(45);
@@ -18,6 +20,7 @@ constexpr auto circuit_dead_sec         = std::chrono::seconds(30);
 constexpr uint32_t MAX_NACK_RETRIES     = 5;
 constexpr auto outgoing_transfer_timeout_sec = std::chrono::seconds(60);
 
+constexpr int MAX_CIRCUIT_BUILD_ATTEMPTS = 5;
 constexpr int MAX_CONNS = 4;
 constexpr int MIN_CONNS = 1;
 constexpr int ROOT_PORT = 12345;
@@ -55,10 +58,20 @@ enum class CircuitState { READY, FAILED, INITIATING };
 
 struct Circuit {
     std::string circuit_id;
-    std::vector<NodeId> path;   // [relay1, relay2, ..., dst]  (excludes src)
+    std::vector<NodeId> path;       // [relay1, relay2, ..., dst]  (excludes src)
+    // path_cids[i] = the CID used on the link *into* path[i].
+    // path_cids[0] == circuit_id (src→relay1), path_cids[1] = relay1→relay2, etc.
+    std::vector<std::string> path_cids;
     CircuitState state = CircuitState::READY;
-    Clock::time_point last_used{};  // last time data was sent through this circuit
-    Clock::time_point last_ack{};   // last time a HOP_REPLY was received on this circuit
+    Clock::time_point last_used{};
+    Clock::time_point last_ack{};
+};
+
+// Relay-side state for one direction of a circuit link.
+// Keyed by in_cid (the CID we received from the upstream hop).
+struct RelayHop {
+    NodeId prev_hop;      // node that sent us packets on in_cid (for sending replies back)
+    std::string out_cid;  // CID we use when forwarding to the next hop
 };
 
 struct ReceivedMsg {
@@ -85,6 +98,33 @@ inline int random_0_to_n(int n) {
     return dis(gen);
 }
 
+struct CircuitInfo
+{
+    std::string circuit_id;
+    NodeId dst;
+    CircuitState state;
+};
+
+struct NodeSnapshot
+{
+    NodeId node_id;
+    int level{-1};
+    bool is_root{false};
+    NodeId daddy;
+    std::vector<NodeId> linked_peers;
+    std::vector<NodeId> known_peers;
+    std::vector<CircuitInfo> circuits;
+};
+
+struct ChatMessage
+{
+    std::string                           from;
+    std::string                           to;
+    std::string                           text;
+    std::chrono::system_clock::time_point when;
+    bool                                  conn_req{false};
+};
+
 class Node : public std::enable_shared_from_this<Node> {
 public:
 
@@ -105,6 +145,12 @@ public:
     void handle_command(const std::string& line);
 
     void handle_link(std::istringstream &iss);
+
+    //GUI
+
+    NodeSnapshot             get_snapshot() const;
+
+    std::vector<ChatMessage> take_new_messages();
 
 private:
     void send_text(const udp::endpoint &target, std::string text);
@@ -241,14 +287,27 @@ private:
         const NodeId& dst,
         int min_hops) const;
 
+// -------------------------- GUI --------------------------
 
+    void update_snapshot();
+
+// -------------------------- heir election --------------------------
+
+    void designate_heir();
+    void take_over_as_root();
+    void on_you_are_heir(const udp::endpoint& from, const proto::Envelope& env);
+    void on_new_root(const udp::endpoint& from, const proto::Envelope& env);
 
 // -------------------------- Attributes --------------------------
     std::string ip_;
     uint16_t port_;
     udp::endpoint ep_;
 
-    bool is_root_ = false;
+    bool   is_root_     = false;
+    bool   is_heir_     = false;
+    NodeId heired_from_;
+    NodeId heir_id_;
+    bool has_heir_{false};
     std::string root_ip_;
     udp::endpoint root_ep_;
     NodeId node_id_;
@@ -265,6 +324,8 @@ private:
     int cur_connections_;
 
     asio::steady_timer prune_timer_;
+    asio::steady_timer register_timer_;
+    int register_retries_ = 0;
 
     std::unordered_set<NodeId> linked_up_;
 
@@ -281,7 +342,10 @@ private:
     std::unordered_map<NodeId, std::string>  circuit_by_dst_;    // dst_id → circuit_id
 
     // onion routing — relay side
-    std::unordered_map<std::string, NodeId> circuit_hop_table_;  // circuit_id → prev_hop_id
+    // in_cid → {prev_hop, out_cid}: the bidirectional CID-switching table.
+    // Each relay stores two entries per circuit: in_cid→out_cid (forward) and out_cid→in_cid (reverse).
+    std::unordered_map<std::string, RelayHop> circuit_hop_table_;   // in_cid  → RelayHop
+    std::unordered_map<std::string, std::string> circuit_reply_table_; // out_cid → in_cid
 
     // onion routing — reply side (populated when a circuit probe is received)
     std::unordered_map<NodeId, std::string> received_circuit_by_src_;  // src_node_id → circuit_id
@@ -291,10 +355,17 @@ private:
     std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> chunk_timers_;            // transfer_id → nack retry timer
     std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> outgoing_transfer_timers_; // transfer_id → sender timeout
     std::unordered_map<std::string, std::unique_ptr<asio::steady_timer>> circuit_timers_;           // circuit_id  → init timeout
+    std::unordered_map<NodeId, int> circuit_build_attempts_;  // dst → consecutive failed build count
 
     //CRYPTO - key maps
     std::unordered_map<std::string, std::vector<std::array<uint8_t, 32>>> circuit_keys_; // src: [k_relay1, k_relay2, k_dst] — relay: [k_i] (just one)
     std::unordered_map<std::string, std::vector<EVP_PKEY*>> circuit_pending_kp_; // src: [e1_kp, e2_kp, e3_kp] — relay: [r_i_kp] (just one, until probe_ack passes through)
+
+    //GUI
+    mutable std::mutex      gui_mutex_;
+    NodeSnapshot            snapshot_;
+    std::mutex              chat_mutex_;
+    std::deque<ChatMessage> chat_log_;
 };
 
 #endif //TROJAN_MESSAGE_NODE_H

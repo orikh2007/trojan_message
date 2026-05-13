@@ -1,9 +1,20 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include "gui/UserGUI.h"
 #include "network/headers/networkSettings.h"
 #include "network/headers/apiComm.h"
 #include "network/headers/Msg.h"
 #include "network/headers/Node.h"
 
 int main(int argc, char* argv[]) {
+    // Single-instance guard: if already running, show the hidden window and exit
+    // HANDLE inst_mutex = CreateMutexW(nullptr, TRUE, L"TrojanMessageMutex");
+    // if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    //     HWND existing = FindWindowW(L"TrojanGUI", nullptr);
+    //     if (existing) PostMessageW(existing, WM_APP + 2, 0, 0);
+    //     return 0;
+    // }
+
     try {
         std::cout << getIP(v4) << "\n";
         int listen_p;
@@ -27,14 +38,9 @@ int main(int argc, char* argv[]) {
 
         std::cout << "CLI ready.\n";
 
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            asio::post(me->io(), [me, line] {
-                me->handle_command(line);
-            });
-
-            if (line == "quit") break;
-        }
+        UserGUI gui(me);
+        gui.run();
+        me->io().stop();
         net_thread.join();
         return 0;
     } catch (std::exception &e) {

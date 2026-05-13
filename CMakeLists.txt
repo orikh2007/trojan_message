@@ -3,11 +3,6 @@ project(trojan_message)
 
 set(CMAKE_CXX_STANDARD 20)
 
-
-if (MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-endif()
-
 if (MSVC)
     add_compile_options(/W4 /permissive- /EHsc)
 else()
@@ -20,11 +15,13 @@ add_executable(trojan_message
         network/headers/apiComm.h
         network/headers/networkSettings.h
         network/headers/Node.h
-        network/headers/Msg.h
         network/source/Node.cpp
+        network/headers/Msg.h
         network/headers/log.h
         encryption/Crypto.cpp
         encryption/Crypto.h
+        gui/UserGUI.cpp
+        gui/UserGUI.h
 )
 
 
@@ -39,6 +36,7 @@ endif()
 find_package(CURL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 target_link_libraries(trojan_message
         PRIVATE
@@ -46,4 +44,8 @@ target_link_libraries(trojan_message
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
+        imgui::imgui
+        d3d11
+        dxgi
+        d3dcompiler
 )
