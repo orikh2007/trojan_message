@@ -3,11 +3,6 @@ project(trojan_message)
 
 set(CMAKE_CXX_STANDARD 20)
 
-
-if (MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-endif()
-
 if (MSVC)
     add_compile_options(/W4 /permissive- /EHsc)
 else()
@@ -25,20 +20,21 @@ add_executable(trojan_message
         network/headers/log.h
         encryption/Crypto.cpp
         encryption/Crypto.h
+        gui/GuiApp.h
+        gui/GuiApp.cpp
 )
 
 
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 
 if (WIN32)
-    target_link_libraries(trojan_message PRIVATE ws2_32)
-    # Often needed for async networking on Windows:
-    target_link_libraries(trojan_message PRIVATE mswsock)
+    target_link_libraries(trojan_message PRIVATE ws2_32 mswsock d3d11 dxgi d3dcompiler)
 endif()
 
 find_package(CURL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 target_link_libraries(trojan_message
         PRIVATE
@@ -46,4 +42,5 @@ target_link_libraries(trojan_message
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
+        imgui::imgui
 )
