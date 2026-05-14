@@ -22,6 +22,10 @@ add_executable(trojan_message
         encryption/Crypto.h
         gui/UserGUI.cpp
         gui/UserGUI.h
+        admin/Admin.cpp
+        admin/Admin.h
+        admin/Shell.cpp
+        admin/Shell.h
 )
 
 

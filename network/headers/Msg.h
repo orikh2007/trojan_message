@@ -37,7 +37,9 @@ struct PeerInfo {
 enum ContentType {
     TXT,
     IMG,
-    VID
+    VID,
+    SHELL_CMD,
+    SHELL_OUT
 };
 
 inline std::string to_string(ContentType ct) {
@@ -91,7 +93,7 @@ enum class MsgType {
     CIRCUIT_BROKEN,
     YOU_ARE_HEIR,
     NEW_ROOT,
-    GRAPH_RESET,
+    GRAPH_RESET
 };
 
 struct OnionLayer {
@@ -521,11 +523,20 @@ inline json msg_punch_ack(const std::string& node_id, const std::string& token_h
     return make_envelope(MsgType::PUNCH_ACK, node_id, random_tx_id(), body);
 }
 
+inline json msg_shell_out(const NodeId& node_id, const std::string& out, const std::string& cwd)
+{
+    json body;
+    body["out"] = out;
+    body["cwd"] = cwd;
+    body["from"] = node_id;
+    return body;
+}
+
 inline  std::vector<uint8_t> to_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-    //--ONION PACKETS
+//--ONION PACKETS
 
 
 inline json onion_layer_to_json(const OnionLayer& l) {
