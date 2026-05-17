@@ -15,8 +15,9 @@ Admin::Admin(int port) {
         cv_.notify_one();
     });
 
-    node_->start();
+    node_->set_admin();
 
+    node_->start();
     net_thread_ = std::thread([this] {
         try {
             node_->io().run();
@@ -61,7 +62,7 @@ void Admin::run_shell_session() {
     while (true) {
         std::cout << active_session_dst_ << "$" << active_session_cwd_ << "> " << std::flush;
         if (!std::getline(std::cin, line)) break;
-        if (line == "disconnect" || line == "exit") {
+        if (line == "dscnct" || line == "exit") {
             active_session_dst_.clear();
             break;
         }
@@ -90,14 +91,14 @@ void Admin::run_shell_session() {
 void Admin::run() {
     asio::post(node_->io(), [n = node_]{ n->handle_command("r"); });
 
-    std::cout << "Admin ready.\n"
-              << "  list            - show known nodes\n"
-              << "  connect <id>    - open shell session with a node\n"
-              << "  quit            - exit\n"
-              << "  root            - become root\n\n";
+    std::cout << "commands:\n"
+                 "lst - list net members\n"
+                 "cnct - connect to id\n"
+                 "rt - become root\n"
+                 "rg - register\n";
 
     std::string line;
-    while (std::cout << "Admin> " && std::getline(std::cin, line)) {
+    while (std::cout << "admin> " && std::getline(std::cin, line)) {
         if (line.empty()) continue;
         std::istringstream iss(line);
         std::string cmd;
@@ -105,7 +106,7 @@ void Admin::run() {
 
         if (cmd == "quit") {
             break;
-        } else if (cmd == "list") {
+        } else if (cmd == "lst") {
             auto snap = node_->get_snapshot();
             auto clients = snap.known_peers;
             if (clients.empty()) { std::cout << "(no known nodes)\n"; continue; }
@@ -115,16 +116,16 @@ void Admin::run() {
                 std::string ip = (it != snap.peer_ips.end()) ? it->second : "unknown";
                 std::cout << "  " << id << "\n";
             }
-        } else if (cmd == "connect") {
+        } else if (cmd == "cnct") {
             NodeId dst;
             iss >> dst;
             if (dst.empty()) { std::cout << "Usage: connect <node_id>\n"; continue; }
             connect_to(dst);
             if (!active_session_dst_.empty())
                 run_shell_session();
-        } else if (cmd == "root") {
+        } else if (cmd == "rt") {
             asio::post(node_->io(), [n = node_]{ n->handle_command("root"); });
-        } else if (cmd == "register") {
+        } else if (cmd == "rg") {
             asio::post(node_->io(), [n = node_]{ n->handle_command("r"); });
         }
         else {

@@ -20,7 +20,8 @@ Node::Node(const uint16_t listen_port)
       cur_connections_(0),
       prune_timer_(io_),
       register_timer_(io_),
-      clients_map_() {
+      clients_map_(), is_admin_(false)
+{
     log_debug("Node init started");
     std::error_code ec;
 
@@ -31,13 +32,15 @@ Node::Node(const uint16_t listen_port)
     log_info("Node ID: {}", node_id_);
 
     socket_.open(udp::v4(), ec);
-    if (ec) {
+    if (ec)
+    {
         io_.stop();
         throw std::runtime_error("socket_.open failed: " + ec.message());
     }
 
     socket_.bind(udp::endpoint(udp::v4(), listen_port), ec);
-    if (ec) {
+    if (ec)
+    {
         io_.stop();
         throw std::runtime_error("socket_.bind failed (port in use?): " + ec.message());
     }
@@ -53,130 +56,6 @@ void Node::start() {
 } //start the receiving io "loop"
 
 asio::io_context& Node::io() { return io_; } //get io context
-
-NodeSnapshot Node::get_snapshot() const {
-    std::lock_guard lock(gui_mutex_);
-    return snapshot_;
-}
-
-std::vector<ChatMessage> Node::take_new_messages() {
-    std::lock_guard lock(chat_mutex_);
-    std::vector<ChatMessage> out(chat_log_.begin(), chat_log_.end());
-    chat_log_.clear();
-    return out;
-}
-
-std::vector<ShellOut> Node::take_shell_outs() {
-    std::lock_guard lock(shell_mutex_);
-    std::vector<ShellOut> outs = shell_outs_;
-    shell_outs_.clear();
-    return outs;
-}
-
-void Node::send_shell_cmd(std::string cmd, NodeId to) {
-    asio::post(io_, [self = shared_from_this(), cmd = std::move(cmd), to = std::move(to)]() {
-        if (!self->circuit_by_dst_.contains(to)) {
-            log_warn("[ADMIN] No circuit to {}", to);
-            return;
-        }
-        self->send_chunked(to, proto::to_bytes(cmd), SHELL_CMD);
-    });
-}
-
-void Node::set_shell_out_callback(std::function<void(ShellOut)> cb) {
-    std::lock_guard lock(shell_mutex_);
-    shell_out_cb_ = std::move(cb);
-}
-
-std::vector<NodeId> Node::get_known_clients() const {
-    std::lock_guard lock(gui_mutex_);
-    return snapshot_.known_peers;
-}
-
-bool Node::has_ready_circuit(const NodeId& dst) const {
-    std::lock_guard lock(gui_mutex_);
-    for (const auto& c : snapshot_.circuits)
-        if (c.dst == dst && c.state == CircuitState::READY)
-            return true;
-    return false;
-}
-
-void Node::update_snapshot() {
-    NodeSnapshot s;
-    s.node_id = node_id_;
-    s.level   = level_;
-    s.is_root = is_root_;
-    s.daddy   = daddy_;
-    s.linked_peers.assign(linked_up_.begin(), linked_up_.end());
-    for (const auto& [dst, cid] : circuit_by_dst_) {
-        auto it = circuits_.find(cid);
-        if (it == circuits_.end()) continue;
-        s.circuits.push_back({cid, dst, it->second.state});
-    }
-    for (const auto& [pid, info] : clients_map_) {
-        s.known_peers.push_back(pid);
-        s.peer_ips[pid] = info.ep.address().to_string() + ":" + std::to_string(info.ep.port());
-    }
-    std::lock_guard lock(gui_mutex_);
-    snapshot_ = std::move(s);
-}
-
-void Node::designate_heir() {
-    if (!is_root_ || linked_up_.empty()) return;
-    std::vector<NodeId> candidates(linked_up_.begin(), linked_up_.end());
-    heir_id_ = candidates[random_0_to_n(static_cast<int>(candidates.size()))];
-    has_heir_ = true;
-    send_text(connections_.at(heir_id_)->ep,
-              proto::dump_compact(proto::msg_you_are_heir(node_id_)));
-    log_info("[HEIR] Designated {} as successor", heir_id_);
-}
-
-void Node::take_over_as_root() {
-    log_info("[ELECTION] Taking over as root");
-    is_heir_ = false;
-    const NodeId dead_root = std::move(heired_from_);
-    heired_from_.clear();
-    become_root();
-    for (auto& [id, info] : clients_map_)
-        info.neighbors.erase(dead_root);
-    clients_map_.erase(dead_root);
-    const auto msg = proto::dump_compact(proto::msg_new_root(node_id_, ip_, dead_root));
-    for (const auto& [id, conn] : connections_)
-        if (conn && conn->connected) send_text(conn->ep, msg);
-    designate_heir();
-    update_snapshot();
-}
-
-void Node::on_you_are_heir(const udp::endpoint& from, const proto::Envelope& env) {
-    heired_from_ = env.body.at("root_id").get<NodeId>();
-    is_heir_     = true;
-    log_info("[HEIR] I am the designated successor to {}", heired_from_);
-}
-
-void Node::on_new_root(const udp::endpoint& from, const proto::Envelope& env) {
-    if (is_root_) return;  // we are the new root — already handled in take_over_as_root
-    const std::string new_ip   = env.body.at("ip").get<std::string>();
-    const NodeId      new_root = env.body.at("root_id").get<NodeId>();
-    const NodeId      old_root = env.body.value("old_root_id", std::string{});
-    std::error_code ec;
-    const auto addr = asio::ip::make_address(new_ip, ec);
-    if (ec) { log_warn("[NEW_ROOT] Bad IP: {}", new_ip); return; }
-    root_ip_ = new_ip;
-    root_ep_ = udp::endpoint(addr, ROOT_PORT);
-    log_info("[NEW_ROOT] Root is now {} at {}", new_root, new_ip);
-    if (!old_root.empty()) {
-        for (auto& [id, info] : clients_map_)
-            info.neighbors.erase(old_root);
-        clients_map_.erase(old_root);
-        remove_connection(old_root);
-        update_snapshot();
-    }
-    choose_parent();
-    const auto fwd = proto::dump_compact(proto::msg_new_root(new_root, new_ip, old_root));
-    for (const auto& [id, conn] : connections_)
-        if (conn && conn->connected && id != env.src)
-            send_text(conn->ep, fwd);
-}
 
 void Node::start_pruner() {
     prune_tick();
@@ -227,8 +106,6 @@ void Node::rebind() {
         self->start_pruner();
     });
 }
-
-
 
 const std::string& Node::id() {return node_id_;} //get node id
 
@@ -306,14 +183,14 @@ void Node::handle_command(const std::string& line) {
                         log_warn("Cannot open file: {}", filepath);
                     } else {
                         std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
-                                                   std::istreambuf_iterator<char>());
+                                                  std::istreambuf_iterator<char>());
                         // Detect content type from extension
                         ContentType ct = TXT;
                         if (filepath.ends_with(".jpg") || filepath.ends_with(".jpeg") ||
                             filepath.ends_with(".png") || filepath.ends_with(".gif"))
                             ct = IMG;
                         else if (filepath.ends_with(".mp4") || filepath.ends_with(".mkv") ||
-                                 filepath.ends_with(".avi") || filepath.ends_with(".mov"))
+                            filepath.ends_with(".avi") || filepath.ends_with(".mov"))
                             ct = VID;
                         log_info("Sending {} bytes to {} as {}", data.size(), dst, to_string(ct));
                         send_chunked(dst, std::move(data), ct);
@@ -335,14 +212,14 @@ void Node::handle_command(const std::string& line) {
             }
         } else {
             std::cout << "Commands:\n"
-                      << "  send <peer_id> <message>\n"
-                      << "  register\n"
-                      << "  root\n"
-                      << "  circuit <dst_id>          - build onion circuit to dst\n"
-                      << "  sanon <dst_id> <msg>      - send anonymously via circuit\n"
-                      << "  sendfile <dst_id> <path>  - send a file anonymously via circuit\n"
-                      << "  reply <src_id> <msg>      - reply back through a received circuit\n"
-                      << "  quit\n";
+                << "  send <peer_id> <message>\n"
+                << "  register\n"
+                << "  root\n"
+                << "  circuit <dst_id>          - build onion circuit to dst\n"
+                << "  sanon <dst_id> <msg>      - send anonymously via circuit\n"
+                << "  sendfile <dst_id> <path>  - send a file anonymously via circuit\n"
+                << "  reply <src_id> <msg>      - reply back through a received circuit\n"
+                << "  quit\n";
         }
     } catch (const std::exception& e) {
         io_.stop();
@@ -367,247 +244,56 @@ void Node::handle_link(std::istringstream& iss) {
     }
 }
 
-void Node::handle_send(std::istringstream& iss) {
-    NodeId to_id;
-    int port_int = 0;
-    iss >> to_id;
+NodeSnapshot Node::get_snapshot() const {
+    std::lock_guard lock(gui_mutex_);
+    return snapshot_;
+}
 
-    if (to_id.empty()) {
-        log_info("Usage: send <to_id> <message>");
-        return;
-    }
-    try {
-        auto& p = *connections_.at(to_id);
-    udp::endpoint tgt_ep = p.ep;
+std::vector<ChatMessage> Node::take_new_messages() {
+    std::lock_guard lock(chat_mutex_);
+    std::vector<ChatMessage> out(chat_log_.begin(), chat_log_.end());
+    chat_log_.clear();
+    return out;
+}
 
-    std::string msg;
-    std::getline(iss, msg);
-    if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
+std::vector<ShellOut> Node::take_shell_outs() {
+    std::lock_guard lock(shell_mutex_);
+    std::vector<ShellOut> outs = shell_outs_;
+    shell_outs_.clear();
+    return outs;
+}
 
-    log_debug("Sending to {} at {}:{}", to_id, p.ep.address().to_string(), p.ep.port());
-
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    uint64_t x = gen();
-
-    auto seq = x%500;
-
-    json j = proto::msg_data_b64(node_id_, to_id, seq, proto::to_bytes(msg));
-
-    auto data = proto::dump_compact(j);
-
-    send_text(tgt_ep, data);
-    log_info("Sent DATA to {}:{}", tgt_ep.address().to_string(), tgt_ep.port());
-    } catch (std::exception e) {
-        log_error("Exception sending message: {}", e.what());
-    }
-} //send someone a message - temporary
-
-void Node::handle_register() {
-    constexpr int MAX_RETRIES = 3;
-    constexpr auto RETRY_TIMEOUT = std::chrono::seconds(3);
-
-    std::error_code ec;
-    root_ip_ = getDDNS();
-    const auto addr = asio::ip::make_address(root_ip_, ec);
-    if (ec) {
-        io_.stop();
-        log_error("Bad root IP address: {} ({})", root_ip_, ec.message());
-        return;
-    }
-    const udp::endpoint ep(addr, ROOT_PORT);
-
-    root_ep_ = ep;
-
-    if (register_retries_ >= MAX_RETRIES) {
-        log_warn("HANDLE_REGISTER: no response after {} attempts, giving up", MAX_RETRIES);
-        register_retries_ = 0;
-        return;
-    }
-
-    register_retries_++;
-    const auto j = proto::msg_register(node_id_, socket_.local_endpoint().port(), 3);
-    const auto data = proto::dump_compact(j);
-    send_text(root_ep_, data);
-    log_info("Sent REGISTER to {}:{}", root_ip_, ROOT_PORT);
-
-
-    register_timer_.expires_after(RETRY_TIMEOUT);
-    register_timer_.async_wait([self = shared_from_this()](const std::error_code& ec) {
-        if (ec == asio::error::operation_aborted) return;
-        if (ec) { log_error("register_timer error: {}", ec.message()); return; }
-        self->handle_register();
-    });
-} //register with the root - send it node id and open port
-
-void Node::request_conns() {
-    constexpr int MAX_RETRIES = 3;
-    constexpr auto RETRY_TIMEOUT = std::chrono::seconds(3);
-
-    if (register_retries_ >= MAX_RETRIES) {
-        log_warn("REQ_CONNS: no response after {} attempts, giving up", MAX_RETRIES);
-        register_retries_ = 0;
-        return;
-    }
-
-    register_retries_++;
-    const auto j    = proto::msg_req_conns(node_id_, port_);
-    const auto data = proto::dump_compact(j);
-    send_text(root_ep_, data);
-    log_debug("Sent REQ_CONNS to root (attempt {}/{})", register_retries_, MAX_RETRIES);
-
-    register_timer_.expires_after(RETRY_TIMEOUT);
-    register_timer_.async_wait([self = shared_from_this()](const std::error_code& ec) {
-        if (ec == asio::error::operation_aborted) return;
-        if (ec) { log_error("req_conns_timer error: {}", ec.message()); return; }
-        self->request_conns();
+void Node::send_shell_cmd(std::string cmd, NodeId to) {
+    asio::post(io_, [self = shared_from_this(), cmd = std::move(cmd), to = std::move(to)]() {
+        if (!self->circuit_by_dst_.contains(to)) {
+            log_warn("[ADMIN] No circuit to {}", to);
+            return;
+        }
+        self->send_chunked(to, proto::to_bytes(cmd), SHELL_CMD);
     });
 }
 
-void Node::handle_dis() {
-    auto msg = proto::msg_disconnect(node_id_);
-    auto data = proto::dump_compact(msg);
-    broadcast(data);
-    for (auto& it : connections_) {
-        link_down(it.first);
-    }
+void Node::set_shell_out_callback(std::function<void(ShellOut)> cb) {
+    std::lock_guard lock(shell_mutex_);
+    shell_out_cb_ = std::move(cb);
 }
 
-void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) { //root function
-    int n = std::min(static_cast<int>(clients_map_.size()) - 1, 4);
-    n = std::min(n, want);
-    std::vector<PeerInfo> peers;
-
-    std::vector<std::string> keys;
-    for (const auto &id: clients_map_ | std::views::keys) keys.push_back(id);
-    std::random_device rd;
-    std::mt19937 gen{rd()};
-    std::ranges::shuffle(keys, gen);
-
-    for (const auto& cli : keys) {
-        if (static_cast<int>(peers.size()) >= n) break;
-        if (cli == curP.peerId) continue;
-        const auto& entry = clients_map_.at(cli);
-        if (entry.ep.address().is_unspecified()) continue; // no valid endpoint (learned via GRAPH_UPDATE only)
-        clients_map_.at(cli).tkn = proto::random_token_hex();
-        peers.push_back(clients_map_.at(cli));
-    }
-
-    const std::string token = proto::random_token_hex();
-
-    const json jNew = proto::msg_register_ack(tx, curP.ep, peers, token); //reg_ack JSON for newcomer
-    const udp::endpoint registeringCli = curP.ep;
-    const auto dataNew = proto::dump_compact(jNew); //reg_ack data for newcomer
-    send_text(registeringCli, dataNew);
-    log_info("Sent REGISTER_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
-
-    for (const auto& membr : peers){
-        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
-        auto epMembr = membr.ep;
-        const auto dataMembr = proto::dump_compact(jMembr);
-        send_text(epMembr, dataMembr);
-        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
-    }
-
-} /* for root - handles register_ack -
-                                                                                                  * sends registering client his peers and token,
-                                                                                                  * and tells the peers to connect to the registering client
-                                                                                                  */
-
-void Node::send_up(const proto::Envelope env) {
-    auto& conn = connections_.at(daddy_);
-    auto ep = conn->ep;
-    auto j = proto::make_envelope(env.type, env.src, env.tx, env.body);
-    send_text(ep, proto::dump_compact(j));
+std::vector<NodeId> Node::get_known_clients() const {
+    std::lock_guard lock(gui_mutex_);
+    return snapshot_.known_peers;
 }
 
-void Node::broadcast(const std::string& msg) {
-    for (auto it = connections_.begin(); it != connections_.end(); ++it) {
-        auto curEp = it->second->ep;
-        send_text(curEp, msg);
-    }
+bool Node::has_ready_circuit(const NodeId& dst) const {
+    std::lock_guard lock(gui_mutex_);
+    for (const auto& c : snapshot_.circuits)
+        if (c.dst == dst && c.state == CircuitState::READY)
+            return true;
+    return false;
 }
 
-void Node::start_punch(const PeerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
-    log_debug("[PUNCH] Starting punch to {} at {}:{}", p.peerId, p.ep.address().to_string(), p.ep.port());
-    auto& slot = connections_[p.peerId];
-    slot = std::make_unique<Connection>(io_, p.ep, tkn);
-    slot->tries = 0;
-    slot->connected = false;
-
-    punch(p.peerId, timeout, punch_ms);
-}
-
-void Node::punch(const std::string& peerId, const int timeout, const int punch_ms) {
-    const auto it = connections_.find(peerId);
-    if (it == connections_.end()) return;
-    auto& a = *it->second;
-    if (a.connected) return;
-
-    const auto j = proto::msg_punch(node_id_, a.punch_token, level_);
-    send_text(a.ep, proto::dump_compact(j));
-
-    a.tries++;
-
-
-
-    if (a.tries >= 8) {
-        log_warn("[PUNCH] Failed to reach {}:{} after {} attempts", a.ep.address().to_string(), a.ep.port(), a.tries);
-        connections_.erase(it);
-        return;
-    }
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    uint64_t x = gen();
-    auto jitt = x%10;
-    log_debug("[PUNCH] Retry {} to {}:{} (jitter {}ms)", a.tries, a.ep.address().to_string(), a.ep.port(), jitt);
-    a.timer.expires_after(std::chrono::milliseconds(punch_ms) + std::chrono::milliseconds(10 * a.tries) + std::chrono::milliseconds(jitt));
-    a.timer.async_wait([self = shared_from_this(), peerId, timeout, punch_ms](const std::error_code& ec){
-        if (ec) return;
-        self->punch(peerId, timeout, punch_ms);
-    });
-}
-
-void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentType content_type) {
-    auto transfer_id = proto::random_tx_id();
-    uint32_t total_chunks = (data.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    auto it = circuit_by_dst_.find(dst);
-    if (it == circuit_by_dst_.end()) {
-        log_warn("[CHUNK] No circuit to {}", dst);
-        return;
-    }
-    auto circuit_id = it->second;
-
-    OutgoingTransfer transfer;
-    transfer.dst          = dst;
-    transfer.content_type = content_type;
-    transfer.total_chunks = total_chunks;
-
-    for (uint32_t i = 0; i < total_chunks; i++) {
-        size_t start = i * CHUNK_SIZE;
-        size_t end = std::min(start + CHUNK_SIZE, data.size());
-        std::vector<uint8_t> raw_chunk(data.begin() + start, data.begin() + end);
-        transfer.chunks.push_back(raw_chunk);
-
-        proto::ChunkMeta chunk{transfer_id, i, total_chunks, content_type, proto::b64_encode(raw_chunk)};
-        auto msg = proto::msg_chunk(node_id_, chunk);
-        send_via_circuit(circuit_id, proto::dump_compact(msg));
-    }
-
-    outgoing_transfers_[transfer_id] = std::move(transfer);
-
-    // Sender-side timeout: if CHUNK_ACK never arrives, free the cache
-    auto xfer_timer = std::make_unique<asio::steady_timer>(io_);
-    xfer_timer->expires_after(outgoing_transfer_timeout_sec);
-    xfer_timer->async_wait([self = shared_from_this(), transfer_id](const std::error_code& ec) {
-        if (ec) return;
-        if (self->outgoing_transfers_.erase(transfer_id))
-            log_warn("[CHUNK] Transfer {} sender-timeout — cache freed", transfer_id);
-        self->outgoing_transfer_timers_.erase(transfer_id);
-    });
-    outgoing_transfer_timers_[transfer_id] = std::move(xfer_timer);
-
-    log_info("[CHUNK] Sent {} chunks for transfer {}", total_chunks, transfer_id);
+void Node::set_admin()
+{
+    is_admin_ = true;
 }
 
 void Node::reply_chunked(const NodeId& src, std::vector<uint8_t> data, ContentType content_type) {
@@ -643,8 +329,10 @@ void Node::send_text(const udp::endpoint& target, std::string text) {
             else {
                 log_debug("SEND -> {}:{}", target.address().to_string(), target.port());
             }
-    });
+        });
 } //sends string text to target.
+
+
 
 void Node::start_receive() {
     socket_.async_receive_from(
@@ -692,87 +380,87 @@ void Node::process_receive(udp::endpoint& from, const std::string &msg) {
 void Node::dispatch(udp::endpoint& from, const proto::Envelope& env) {
     log_debug("Dispatch: {}", proto::to_string(env.type));
     switch (env.type) {
-        case MsgType::REGISTER:
-            on_register(from, env);
-            break;
-        case MsgType::REGISTER_ACK:
-            on_register_ack(from, env);
-            break;
-        case MsgType::KEEPALIVE:
-            on_keepalive(from, env);
-            break;
-        case MsgType::PEER_LIST:
-            break;
-        case MsgType::INTRODUCE:
-            on_introduce(from, env);
-            break;
-        case MsgType::PUNCH:
-            on_punch(from, env);
-            break;
-        case MsgType::PUNCH_ACK:
-            on_punch_ack(from, env);
-            break;
-        case MsgType::DATA:
-            on_data(from, env);
-            break;
-        case MsgType::ERROR_:
-            break;
-        case MsgType::DISCONNECT:
-            on_disconnect(from, env);
-            break;
-        case MsgType::LINK_UP:
-            on_linkup(from, env);
-            break;
-        case MsgType::LINK_DOWN:
-            on_linkdown(from, env);
-            break;
-        case MsgType::REQ_CONNS:
-            on_req_conns(from, env);
-            break;
-        case MsgType::REQ_CONNS_ACK:
-            on_req_conns_ack(from, env);
-            break;
-        case MsgType::HOP:
-            on_hop(from, env);
-            break;
-        case MsgType::HOP_REPLY:
-            on_hop_reply(from, env);
-            break;
-        case MsgType::CIRCUIT_BROKEN:
-            on_circuit_broken(from, env);
-            break;
-        case MsgType::YOU_ARE_HEIR:
-            on_you_are_heir(from, env);
-            break;
-        case MsgType::NEW_ROOT:
-            on_new_root(from, env);
-            break;
-        case MsgType::GRAPH_RESET: {
-            std::vector<NodeId> stale;
-            for (const auto& [id, _] : clients_map_)
-                if (id != node_id_) stale.push_back(id);
-            for (const auto& id : stale) clients_map_.erase(id);
-            graph_seq_.clear();
-            update_snapshot();
-            break;
-        }
-        case MsgType::GRAPH_UPDATE:
-            on_graph_update(from, env);
-            break;
-        case MsgType::INTRODUCE_REQ:
-            on_introduce_req(from, env);
-            break;
-        case MsgType::CHUNK:
-            on_chunk(from, env);
-            break;
-        case MsgType::CHUNK_ACK:
-            on_chunk_ack(from, env);
-            break;
-        case MsgType::CHUNK_NACK:
-            on_chunk_nack(from, env);
-            break;
-        default:
-            log_warn("Unhandled message type: {}", static_cast<int>(env.type));
+    case MsgType::REGISTER:
+        on_register(from, env);
+        break;
+    case MsgType::REGISTER_ACK:
+        on_register_ack(from, env);
+        break;
+    case MsgType::KEEPALIVE:
+        on_keepalive(from, env);
+        break;
+    case MsgType::PEER_LIST:
+        break;
+    case MsgType::INTRODUCE:
+        on_introduce(from, env);
+        break;
+    case MsgType::PUNCH:
+        on_punch(from, env);
+        break;
+    case MsgType::PUNCH_ACK:
+        on_punch_ack(from, env);
+        break;
+    case MsgType::DATA:
+        on_data(from, env);
+        break;
+    case MsgType::ERROR_:
+        break;
+    case MsgType::DISCONNECT:
+        on_disconnect(from, env);
+        break;
+    case MsgType::LINK_UP:
+        on_linkup(from, env);
+        break;
+    case MsgType::LINK_DOWN:
+        on_linkdown(from, env);
+        break;
+    case MsgType::REQ_CONNS:
+        on_req_conns(from, env);
+        break;
+    case MsgType::REQ_CONNS_ACK:
+        on_req_conns_ack(from, env);
+        break;
+    case MsgType::HOP:
+        on_hop(from, env);
+        break;
+    case MsgType::HOP_REPLY:
+        on_hop_reply(from, env);
+        break;
+    case MsgType::CIRCUIT_BROKEN:
+        on_circuit_broken(from, env);
+        break;
+    case MsgType::YOU_ARE_HEIR:
+        on_you_are_heir(from, env);
+        break;
+    case MsgType::NEW_ROOT:
+        on_new_root(from, env);
+        break;
+    case MsgType::GRAPH_RESET: {
+        std::vector<NodeId> stale;
+        for (const auto& [id, _] : clients_map_)
+            if (id != node_id_) stale.push_back(id);
+        for (const auto& id : stale) clients_map_.erase(id);
+        graph_seq_.clear();
+        update_snapshot();
+        break;
+    }
+    case MsgType::GRAPH_UPDATE:
+        on_graph_update(from, env);
+        break;
+    case MsgType::INTRODUCE_REQ:
+        on_introduce_req(from, env);
+        break;
+    case MsgType::CHUNK:
+        on_chunk(from, env);
+        break;
+    case MsgType::CHUNK_ACK:
+        on_chunk_ack(from, env);
+        break;
+    case MsgType::CHUNK_NACK:
+        on_chunk_nack(from, env);
+        break;
+    default:
+        log_warn("Unhandled message type: {}", static_cast<int>(env.type));
     }
 } //dispatches funcs according to message type
 
@@ -1106,393 +794,252 @@ void Node::on_data(const udp::endpoint& from, const proto::Envelope& env) {
     log_info("DATA from {}: {}", env.src, msg);
 }
 
-void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
-    const std::string& raw_payload = env.body.at("payload").get<std::string>();
-    const std::string circuit_id = env.body.value("circuit_id", "");
-
-    // HOP.body["payload"] is always b64(OnionLayer_json)
-    auto decoded = proto::b64_decode(raw_payload);
-    if (!decoded) { log_error("[HOP] Outer b64_decode failed"); return; }
-
-    std::string layer_json(decoded->begin(), decoded->end());
-    proto::OnionLayer layer;
-    try {
-        layer = proto::onion_layer_from_json(json::parse(layer_json));
-    } catch (const std::exception& e) {
-        log_error("[HOP] Bad OnionLayer: {}", e.what());
-        return;
-    }
-
-    if (layer.next_id.empty()) {
-        // Terminal (exit node) — record who sent this so replies can travel back
-        if (!circuit_id.empty()) {
-            auto& entry = circuit_hop_table_[circuit_id];
-            if (entry.prev_hop.empty()) {
-                entry.prev_hop = env.src;
-                entry.out_cid  = "";   // exit doesn't forward; no out_cid
-            }
-        }
-        if (layer.circuit_init && !circuit_id.empty()) {
-            auto kp = crypto::gen_keypair();
-            auto secret = crypto::hkdf_sha256(crypto::derive_secret(kp, layer.src_pub), circuit_id);
-            circuit_keys_[circuit_id] = std::vector{secret};
-            circuit_pending_kp_[circuit_id] = std::vector{kp};
-            const auto my_pub = crypto::get_pubkey(kp);
-            const std::vector<uint8_t> my_pub_vec(my_pub.begin(), my_pub.end());
-            auto ack_payload_json = json{
-                {"type","probe_ack"},
-                {"keys",json::array({proto::b64_encode(my_pub_vec)})}}.dump(-1);
-            auto ack_b64 = proto::b64_encode(proto::to_bytes(ack_payload_json));
-            const NodeId& prev = circuit_hop_table_[circuit_id].prev_hop;
-            auto ack = proto::msg_hop_reply(circuit_id, ack_b64, node_id_);
-            auto ret_it = connections_.find(prev);
-            if (ret_it == connections_.end()) {
-                log_error("[DST_HOP] Can't return probe — no connection to {}", prev);
-                return;
-            }
-            send_text(ret_it->second->ep, proto::dump_compact(ack));
-        }
-        std::string deliver_payload = layer.payload;
-        if (!layer.circuit_init && !circuit_id.empty()) {
-            if (auto ck_find = circuit_keys_.find(circuit_id); ck_find != circuit_keys_.end()) {
-                auto enc = proto::b64_decode(layer.payload);
-                if (!enc) {
-                    log_error("[HOP] failed to decode payload");
-                    return;
-                }
-                auto dec = crypto::decrypt(ck_find->second[0], *enc);
-                if (!dec) {
-                    log_error("[HOP] failed to decrypt payload");
-                    return;
-                }
-                deliver_payload = proto::b64_encode(*dec);
-            }
-        }
-        auto inner = proto::b64_decode(deliver_payload);
-        if (!inner) { log_error("[HOP] Inner b64_decode failed"); return; }
-        std::string inner_str(inner->begin(), inner->end());
-
-        // Try to re-dispatch as a control message
-        try {
-            proto::Envelope inner_env = proto::parse_envelope(inner_str);
-            dispatch(const_cast<udp::endpoint&>(from), inner_env);
-        } catch (...) {
-            // Try to parse as a circuit JSON control message
-            try {
-                const json j = json::parse(inner_str);
-                const std::string type = j.value("type", "");
-                if (type == "probe" && !circuit_id.empty()) {
-                    const NodeId sender = j.at("src").get<std::string>();
-                    // Clean up the old circuit's state before registering the replacement
-                    if (auto old_it = received_circuit_by_src_.find(sender);
-                        old_it != received_circuit_by_src_.end() && old_it->second != circuit_id)
-                        cleanup_relay_circuit(old_it->second);
-                    received_circuit_by_src_[sender] = circuit_id;
-                    log_info("[HOP] Circuit established from {}. Reply with: reply {} <message>",
-                             sender, sender);
-                } else {
-                    log_info("[HOP] Delivered: {}", inner_str);
-                }
-            } catch (...) {
-                log_info("[HOP] Delivered: {}", inner_str);
-            }
-        }
-    } else {
-        // Relay — populate the CID-switching table on first sight of this circuit
-        std::string out_cid;
-        if (!circuit_id.empty()) {
-            auto& entry = circuit_hop_table_[circuit_id];
-            if (entry.prev_hop.empty()) {
-                entry.prev_hop = env.src;
-                // Use the initiator-assigned next_cid if present; otherwise generate one
-                entry.out_cid = !layer.next_cid.empty()
-                                ? layer.next_cid
-                                : proto::random_tx_id();
-                circuit_reply_table_[entry.out_cid] = circuit_id;
-            }
-            out_cid = entry.out_cid;
-        }
-
-        auto it = connections_.find(layer.next_id);
-        if (it == connections_.end() || !it->second || !it->second->connected) {
-            log_warn("[HOP] No connection to next hop: {} - sending CIRCUIT_BROKEN", layer.next_id);
-            if (!circuit_id.empty()) {
-                auto back_it = circuit_hop_table_.find(circuit_id);
-                if (back_it != circuit_hop_table_.end()) {
-                    auto conn_it = connections_.find(back_it->second.prev_hop);
-                    if (conn_it != connections_.end() && conn_it->second && conn_it->second->connected) {
-                        const json broken = proto::msg_circuit_broken(circuit_id, node_id_);
-                        send_text(conn_it->second->ep, proto::dump_compact(broken));
-                        log_debug("[HOP] CIRCUIT_BROKEN for {} sent back to {}", circuit_id, back_it->second.prev_hop);
-                    }
-                }
-            }
-            return;
-        }
-        if (layer.circuit_init) {
-            EVP_PKEY* kp = crypto::gen_keypair();
-            // Key is bound to in_cid (circuit_id here) — same value A used for this hop
-            std::array<uint8_t, 32> sym_key = crypto::hkdf_sha256(crypto::derive_secret(kp, layer.src_pub), circuit_id);
-            circuit_keys_[circuit_id] = std::vector{sym_key};
-            circuit_pending_kp_[circuit_id] = std::vector{kp};
-        }
-        std::string payload = layer.payload;
-        if (auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end() && !layer.circuit_init) {
-            auto enc_payload = proto::b64_decode(layer.payload);
-            if (!enc_payload) { log_error("[HOP] Circuit payload decrypt failed"); return; }
-            auto dec_payload = crypto::decrypt(ck_it->second[0], *enc_payload);
-            if (!dec_payload) { log_error("[HOP] Circuit payload decrypt failed"); return; }
-            payload = proto::b64_encode(*dec_payload);
-        }
-        // Forward with out_cid — the CID on the next link is different from the one we received
-        auto fwd = proto::msg_hop(payload, node_id_, out_cid);
-        send_text(it->second->ep, proto::dump_compact(fwd));
-        log_debug("[HOP] Relay: {} -> {}", circuit_id, out_cid);
-    }
-}
-
-void Node::on_hop_reply(const udp::endpoint& from, const proto::Envelope& env) {
-    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
-    std::string payload_b64 = env.body.at("payload").get<std::string>();
-
-    // If we originated this circuit, deliver the reply
-    if (circuits_.contains(circuit_id)) {
-        auto decoded = proto::b64_decode(payload_b64);
-        if (!decoded) { log_error("[HOP_REPLY] b64_decode failed"); return; }
-        std::string msg(decoded->begin(), decoded->end());
-        if (!circuit_keys_.contains(circuit_id)) {
-            auto msg_j = json::parse(msg);
-            if (msg_j.value("type", "") != "probe_ack") {
-                log_error("[HOP_REPLY] Got an unknown packet");
-                return;
-            }
-            std::vector<std::array<uint8_t, 32>> shared_keys;
-            auto& keys_json = msg_j.at("keys");
-            shared_keys.resize(keys_json.size());
-            const auto& path_cids = circuits_[circuit_id].path_cids;
-            for (size_t i = 0; i < keys_json.size(); i++) {
-                auto key_b64 = keys_json[i].get<std::string>();
-                auto key = proto::b64_decode(key_b64);
-                if (!key) {
-                    log_error("[HOP_REPLY] key b64_decode failed");
-                    return;
-                }
-                std::array<uint8_t, 32> peer_pub{};
-                std::ranges::copy(*key, peer_pub.begin());
-                const size_t kp_idx = keys_json.size() - 1 - i;
-                // Each hop derived its key using its own in_cid (path_cids[kp_idx]), not circuit_id
-                const std::string& hop_cid = (kp_idx < path_cids.size()) ? path_cids[kp_idx] : circuit_id;
-                auto shared_key = crypto::hkdf_sha256(crypto::derive_secret(circuit_pending_kp_[circuit_id][kp_idx], peer_pub), hop_cid);
-                shared_keys.at(shared_keys.size() - i - 1) = shared_key;
-                crypto::free_keypair(circuit_pending_kp_[circuit_id][kp_idx]);
-            }
-            circuit_pending_kp_.erase(circuit_id);
-            circuit_keys_[circuit_id] = std::move(shared_keys);
-            cancel_circuit_timer(circuit_id);
-            log_debug("[HOP_REPLY] Circuit_id: {} has been established", circuit_id);
-            circuits_[circuit_id].state   = CircuitState::READY;
-            update_snapshot();
-            circuits_[circuit_id].last_ack = Clock::now();
-            circuit_build_attempts_.erase(circuits_[circuit_id].path.back());
-        }
-        else {
-            for (std::array<uint8_t, 32>& key : circuit_keys_[circuit_id]) {
-                decoded = crypto::decrypt(key, *decoded);
-                if (!decoded) { log_error("[HOP_REPLY] reply decrypt failed"); return; }
-            }
-            if (auto c_it = circuits_.find(circuit_id); c_it != circuits_.end())
-                c_it->second.last_ack = Clock::now();
-            msg = std::string(decoded->begin(), decoded->end());
-            // Re-dispatch as a protocol message (CHUNK_ACK, CHUNK_NACK, etc.)
-            try {
-                proto::Envelope inner_env = proto::parse_envelope(msg);
-                dispatch(const_cast<udp::endpoint&>(from), inner_env);
-            } catch (...) {
-                log_info("[HOP_REPLY] [circuit={}] Reply: {}", circuit_id, msg);
-            }
-        }
-        return;
-    }
-
-    // We're a relay — the circuit_id we received is our out_cid; translate back to in_cid
-    auto reply_it = circuit_reply_table_.find(circuit_id);
-    if (reply_it == circuit_reply_table_.end()) {
-        log_warn("[HOP_REPLY] Unknown out_cid: {}", circuit_id);
-        return;
-    }
-    const std::string in_cid = reply_it->second;
-
-    auto it = circuit_hop_table_.find(in_cid);
-    if (it == circuit_hop_table_.end()) {
-        log_warn("[HOP_REPLY] No hop entry for in_cid: {}", in_cid);
-        return;
-    }
-    const NodeId& prev_hop = it->second.prev_hop;
-    auto conn_it = connections_.find(prev_hop);
-    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
-        log_warn("[HOP_REPLY] No connection to prev hop: {}", prev_hop);
-        return;
-    }
-    // Keys are stored under in_cid (the CID we received from upstream)
-    if (auto cpkp_it = circuit_pending_kp_.find(in_cid); cpkp_it != circuit_pending_kp_.end()) {
-        auto payload = proto::b64_decode(payload_b64);
-        if (!payload) { log_error("[HOP_REPLY] payload decode failed"); return; }
-        std::string pl_json_str(payload->begin(), payload->end());
-        json pl_json = json::parse(pl_json_str);
-        auto keys = pl_json["keys"].get<json::array_t>();
-        auto my_pub = crypto::get_pubkey(cpkp_it->second[0]);
-        auto my_pub_vec = std::vector<uint8_t>(my_pub.begin(), my_pub.end());
-        keys.push_back(proto::b64_encode(my_pub_vec));
-        pl_json["keys"] = keys;
-        auto pl_str = proto::dump_compact(pl_json);
-        payload_b64 = proto::b64_encode(proto::to_bytes(pl_str));
-        crypto::free_keypair(cpkp_it->second[0]);
-        circuit_pending_kp_.erase(in_cid);
-    } else if (auto ck_it = circuit_keys_.find(in_cid); ck_it != circuit_keys_.end()) {
-        auto raw = proto::b64_decode(payload_b64);
-        if (!raw) { log_error("[HOP_REPLY] relay encrypt: b64_decode failed"); return; }
-        payload_b64 = proto::b64_encode(crypto::encrypt(ck_it->second[0], *raw));
-    }
-    // Forward backwards with in_cid — CID is switched back to what the upstream expects
-    const json fwd = proto::msg_hop_reply(in_cid, payload_b64, node_id_);
-    send_text(conn_it->second->ep, proto::dump_compact(fwd));
-    log_debug("[HOP_REPLY] Relay: {} -> {}", circuit_id, in_cid);
-}
-
-void Node::on_circuit_broken(const udp::endpoint& from, const proto::Envelope& env) {
-    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
-
-    // If we own this circuit, mark it failed and rebuild
-    auto it = circuits_.find(circuit_id);
-    if (it != circuits_.end()) {
-        if (it->second.state == CircuitState::INITIATING) {
-            log_debug("[CIRCUIT_BROKEN] Circuit {} already rebuilding", circuit_id);
-            return;
-        }
-        const NodeId dst = it->second.path.back();
-        it->second.state = CircuitState::INITIATING; // block duplicate CIRCUIT_BROKEN messages
-        log_warn("[CIRCUIT {}] Broken in transit - rebuilding to {}", circuit_id, dst);
-        cancel_circuit_timer(circuit_id);
-        circuits_.erase(it);
-        if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
-            for (auto* kp : kp_it->second) crypto::free_keypair(kp);
-            circuit_pending_kp_.erase(kp_it);
-        }
-        circuit_keys_.erase(circuit_id);
-        begin_circuit_build(dst);
-        return;
-    }
-
-    // We're a relay — received circuit_id is our out_cid; translate to in_cid first
-    auto reply_it = circuit_reply_table_.find(circuit_id);
-    if (reply_it == circuit_reply_table_.end()) {
-        log_warn("[CIRCUIT_BROKEN] Unknown out_cid {}", circuit_id);
-        return;
-    }
-    const std::string in_cid = reply_it->second;
-    auto back_it = circuit_hop_table_.find(in_cid);
-    if (back_it == circuit_hop_table_.end()) {
-        log_warn("[CIRCUIT_BROKEN] No hop entry for in_cid {}", in_cid);
-        return;
-    }
-    const NodeId& prev_hop = back_it->second.prev_hop;
-    auto conn_it = connections_.find(prev_hop);
-    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
-        log_warn("[CIRCUIT_BROKEN] Can't propagate - no connection to {}", prev_hop);
-        cleanup_relay_circuit(in_cid);
-        return;
-    }
-    // Propagate backwards with in_cid so the upstream hop recognises it
-    const json fwd = proto::msg_circuit_broken(in_cid, node_id_);
-    send_text(conn_it->second->ep, proto::dump_compact(fwd));
-    cleanup_relay_circuit(in_cid);
-    log_debug("[CIRCUIT_BROKEN] Forwarded {} -> {} back to {}", circuit_id, in_cid, prev_hop);
-}
-
-void Node::send_reply_via_circuit(const std::string& circuit_id, const std::string& data) {
-    auto it = circuit_hop_table_.find(circuit_id);
-    if (it == circuit_hop_table_.end()) {
-        log_warn("[REPLY] No return path for circuit {}. Was a message received on this circuit?", circuit_id);
-        return;
-    }
-    const NodeId& prev_hop = it->second.prev_hop;
-    auto conn_it = connections_.find(prev_hop);
-    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
-        log_warn("[REPLY] No connection to relay {}", prev_hop);
-        return;
-    }
-    std::vector<uint8_t> data_bytes = proto::to_bytes(data);
-    if (const auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end())
-        data_bytes = crypto::encrypt(ck_it->second[0], data_bytes);
-    const std::string payload = proto::b64_encode(data_bytes);
-    const json msg = proto::msg_hop_reply(circuit_id, payload, node_id_);
-    send_text(conn_it->second->ep, proto::dump_compact(msg));
-    log_info("[REPLY] Sent reply on circuit {}", circuit_id);
-}
-
 void Node::on_disconnect(const udp::endpoint& from, const proto::Envelope& env) {
     remove_connection(env.src);
     link_down(env.src);
 }
 
-void Node::broadcast_graph_update(const NodeId& node) { // root only
-    auto it = clients_map_.find(node);
-    if (it == clients_map_.end()) return;
-    const uint64_t seq = ++graph_seq_out_[node];
-    const json msg = proto::msg_graph_update(node_id_, node, it->second.neighbors, seq);
-    const std::string data = proto::dump_compact(msg);
-    for (const auto& [id, conn] : connections_) {
-        if (conn && conn->connected) send_text(conn->ep, data);
+void Node::handle_send(std::istringstream& iss) {
+    NodeId to_id;
+    int port_int = 0;
+    iss >> to_id;
+
+    if (to_id.empty()) {
+        log_info("Usage: send <to_id> <message>");
+        return;
     }
-    log_debug("[ROOT] Broadcast GRAPH_UPDATE for {} seq={}", node, seq);
+    try {
+        auto& p = *connections_.at(to_id);
+        udp::endpoint tgt_ep = p.ep;
+
+        std::string msg;
+        std::getline(iss, msg);
+        if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
+
+        log_debug("Sending to {} at {}:{}", to_id, p.ep.address().to_string(), p.ep.port());
+
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        uint64_t x = gen();
+
+        auto seq = x%500;
+
+        json j = proto::msg_data_b64(node_id_, to_id, seq, proto::to_bytes(msg));
+
+        auto data = proto::dump_compact(j);
+
+        send_text(tgt_ep, data);
+        log_info("Sent DATA to {}:{}", tgt_ep.address().to_string(), tgt_ep.port());
+    } catch (std::exception e) {
+        log_error("Exception sending message: {}", e.what());
+    }
+} //send someone a message - temporary
+
+void Node::handle_register() {
+    constexpr int MAX_RETRIES = 3;
+    constexpr auto RETRY_TIMEOUT = std::chrono::seconds(3);
+
+    std::error_code ec;
+    root_ip_ = getDDNS();
+    const auto addr = asio::ip::make_address(root_ip_, ec);
+    if (ec) {
+        io_.stop();
+        log_error("Bad root IP address: {} ({})", root_ip_, ec.message());
+        return;
+    }
+    const udp::endpoint ep(addr, ROOT_PORT);
+
+    root_ep_ = ep;
+
+    if (register_retries_ >= MAX_RETRIES) {
+        log_warn("HANDLE_REGISTER: no response after {} attempts, giving up", MAX_RETRIES);
+        register_retries_ = 0;
+        return;
+    }
+
+    register_retries_++;
+    const auto j = proto::msg_register(node_id_, socket_.local_endpoint().port(), 3);
+    const auto data = proto::dump_compact(j);
+    send_text(root_ep_, data);
+    log_info("Sent REGISTER to {}:{}", root_ip_, ROOT_PORT);
+
+
+    register_timer_.expires_after(RETRY_TIMEOUT);
+    register_timer_.async_wait([self = shared_from_this()](const std::error_code& ec) {
+        if (ec == asio::error::operation_aborted) return;
+        if (ec) { log_error("register_timer error: {}", ec.message()); return; }
+        self->handle_register();
+    });
+} //register with the root - send it node id and open port
+
+void Node::handle_dis() {
+    auto msg = proto::msg_disconnect(node_id_);
+    auto data = proto::dump_compact(msg);
+    broadcast(data);
+    for (auto& it : connections_) {
+        link_down(it.first);
+    }
 }
 
-void Node::send_graph_snapshot(const udp::endpoint& to) { // root only
-    // Tell the receiver to wipe stale graph entries before applying fresh state
-    send_text(to, proto::dump_compact(proto::msg_graph_reset()));
-    for (const auto& [id, entry] : clients_map_) {
-        const uint64_t seq = ++graph_seq_out_[id];
-        const json msg = proto::msg_graph_update(node_id_, id, entry.neighbors, seq, true);
-        send_text(to, proto::dump_compact(msg));
+void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, const int want) { //root function
+    int n = std::min(static_cast<int>(clients_map_.size()) - 1, 4);
+    n = std::min(n, want);
+    std::vector<PeerInfo> peers;
+
+    std::vector<std::string> keys;
+    for (const auto &id: clients_map_ | std::views::keys) keys.push_back(id);
+    std::random_device rd;
+    std::mt19937 gen{rd()};
+    std::ranges::shuffle(keys, gen);
+
+    for (const auto& cli : keys) {
+        if (static_cast<int>(peers.size()) >= n) break;
+        if (cli == curP.peerId) continue;
+        const auto& entry = clients_map_.at(cli);
+        if (entry.ep.address().is_unspecified()) continue; // no valid endpoint (learned via GRAPH_UPDATE only)
+        clients_map_.at(cli).tkn = proto::random_token_hex();
+        peers.push_back(clients_map_.at(cli));
     }
-    log_info("[ROOT] Sent graph snapshot ({} nodes) to {}:{}", clients_map_.size(), to.address().to_string(), to.port());
+
+    const std::string token = proto::random_token_hex();
+
+    const json jNew = proto::msg_register_ack(tx, curP.ep, peers, token); //reg_ack JSON for newcomer
+    const udp::endpoint registeringCli = curP.ep;
+    const auto dataNew = proto::dump_compact(jNew); //reg_ack data for newcomer
+    send_text(registeringCli, dataNew);
+    log_info("Sent REGISTER_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
+
+    for (const auto& membr : peers){
+        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
+        auto epMembr = membr.ep;
+        const auto dataMembr = proto::dump_compact(jMembr);
+        send_text(epMembr, dataMembr);
+        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
+    }
+
+} /* for root - handles register_ack -
+                                                                                                  * sends registering client his peers and token,
+                                                                                                  * and tells the peers to connect to the registering client
+                                                                                                  */
+
+void Node::send_up(const proto::Envelope env) {
+    auto& conn = connections_.at(daddy_);
+    auto ep = conn->ep;
+    auto j = proto::make_envelope(env.type, env.src, env.tx, env.body);
+    send_text(ep, proto::dump_compact(j));
 }
 
-void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env) {
-    const NodeId node     = env.body.at("node").get<std::string>();
-    const uint64_t seq    = env.body.at("seq").get<uint64_t>();
-    const json& neigh_arr = env.body.at("neighbors");
-    const bool initial    = env.body.value("initial", false);
+void Node::request_conns() {
+    constexpr int MAX_RETRIES = 3;
+    constexpr auto RETRY_TIMEOUT = std::chrono::seconds(3);
 
-    // Dedup: drop if we've already seen this seq for this node
-    if (auto it = graph_seq_.find(node); it != graph_seq_.end() && seq <= it->second) return;
-    graph_seq_[node] = seq;
-
-    // Upsert into local graph
-    auto& entry = clients_map_[node];
-    entry.peerId = node;
-    entry.neighbors.clear();
-    for (const auto& n : neigh_arr) entry.neighbors.insert(n.get<std::string>());
-
-    log_info("[GRAPH] Updated {} neighbors={} seq={}", node, entry.neighbors.size(), seq);
-
-    // Initial snapshot messages are point-to-point from root - don't re-flood
-    if (initial) { update_snapshot(); return; }
-
-    // Re-flood to all connections except the sender
-    const std::string fwd = proto::dump_compact(
-        proto::msg_graph_update(node_id_, node, entry.neighbors, seq));
-    for (const auto& [id, conn] : connections_) {
-        if (id != env.src && conn && conn->connected)
-            send_text(conn->ep, fwd);
+    if (register_retries_ >= MAX_RETRIES) {
+        log_warn("REQ_CONNS: no response after {} attempts, giving up", MAX_RETRIES);
+        register_retries_ = 0;
+        return;
     }
 
-    // Node has no more connections — remove it from local graph
-    if (entry.neighbors.empty() && node != node_id_) {
-        clients_map_.erase(node);
-        log_debug("[GRAPH] Removed {} (no neighbors)", node);
+    register_retries_++;
+    const auto j    = proto::msg_req_conns(node_id_, port_);
+    const auto data = proto::dump_compact(j);
+    send_text(root_ep_, data);
+    log_debug("Sent REQ_CONNS to root (attempt {}/{})", register_retries_, MAX_RETRIES);
+
+    register_timer_.expires_after(RETRY_TIMEOUT);
+    register_timer_.async_wait([self = shared_from_this()](const std::error_code& ec) {
+        if (ec == asio::error::operation_aborted) return;
+        if (ec) { log_error("req_conns_timer error: {}", ec.message()); return; }
+        self->request_conns();
+    });
+}
+
+void Node::broadcast(const std::string& msg) {
+    for (auto it = connections_.begin(); it != connections_.end(); ++it) {
+        auto curEp = it->second->ep;
+        send_text(curEp, msg);
     }
-    update_snapshot();
+}
+
+void Node::start_punch(const PeerInfo& p, const int timeout, const int punch_ms, const std::string& tkn) {
+    log_debug("[PUNCH] Starting punch to {} at {}:{}", p.peerId, p.ep.address().to_string(), p.ep.port());
+    auto& slot = connections_[p.peerId];
+    slot = std::make_unique<Connection>(io_, p.ep, tkn);
+    slot->tries = 0;
+    slot->connected = false;
+
+    punch(p.peerId, timeout, punch_ms);
+}
+
+void Node::punch(const std::string& peerId, const int timeout, const int punch_ms) {
+    const auto it = connections_.find(peerId);
+    if (it == connections_.end()) return;
+    auto& a = *it->second;
+    if (a.connected) return;
+
+    const auto j = proto::msg_punch(node_id_, a.punch_token, level_);
+    send_text(a.ep, proto::dump_compact(j));
+
+    a.tries++;
+
+
+
+    if (a.tries >= 8) {
+        log_warn("[PUNCH] Failed to reach {}:{} after {} attempts", a.ep.address().to_string(), a.ep.port(), a.tries);
+        connections_.erase(it);
+        return;
+    }
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    uint64_t x = gen();
+    auto jitt = x%10;
+    log_debug("[PUNCH] Retry {} to {}:{} (jitter {}ms)", a.tries, a.ep.address().to_string(), a.ep.port(), jitt);
+    a.timer.expires_after(std::chrono::milliseconds(punch_ms) + std::chrono::milliseconds(10 * a.tries) + std::chrono::milliseconds(jitt));
+    a.timer.async_wait([self = shared_from_this(), peerId, timeout, punch_ms](const std::error_code& ec){
+        if (ec) return;
+        self->punch(peerId, timeout, punch_ms);
+    });
+}
+
+void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentType content_type) {
+    auto transfer_id = proto::random_tx_id();
+    uint32_t total_chunks = (data.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    auto it = circuit_by_dst_.find(dst);
+    if (it == circuit_by_dst_.end()) {
+        log_warn("[CHUNK] No circuit to {}", dst);
+        return;
+    }
+    auto circuit_id = it->second;
+
+    OutgoingTransfer transfer;
+    transfer.dst          = dst;
+    transfer.content_type = content_type;
+    transfer.total_chunks = total_chunks;
+
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        size_t start = i * CHUNK_SIZE;
+        size_t end = std::min(start + CHUNK_SIZE, data.size());
+        std::vector<uint8_t> raw_chunk(data.begin() + start, data.begin() + end);
+        transfer.chunks.push_back(raw_chunk);
+
+        proto::ChunkMeta chunk{transfer_id, i, total_chunks, content_type, proto::b64_encode(raw_chunk)};
+        auto msg = proto::msg_chunk(node_id_, chunk);
+        send_via_circuit(circuit_id, proto::dump_compact(msg));
+    }
+
+    outgoing_transfers_[transfer_id] = std::move(transfer);
+
+    // Sender-side timeout: if CHUNK_ACK never arrives, free the cache
+    auto xfer_timer = std::make_unique<asio::steady_timer>(io_);
+    xfer_timer->expires_after(outgoing_transfer_timeout_sec);
+    xfer_timer->async_wait([self = shared_from_this(), transfer_id](const std::error_code& ec) {
+        if (ec) return;
+        if (self->outgoing_transfers_.erase(transfer_id))
+            log_warn("[CHUNK] Transfer {} sender-timeout — cache freed", transfer_id);
+        self->outgoing_transfer_timers_.erase(transfer_id);
+    });
+    outgoing_transfer_timers_[transfer_id] = std::move(xfer_timer);
+
+    log_info("[CHUNK] Sent {} chunks for transfer {}", total_chunks, transfer_id);
 }
 
 void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) { //root function
@@ -1670,6 +1217,7 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
             chat_log_.push_back(std::move(cm));
         }
     } else if (ct == SHELL_CMD) {
+        if (is_admin_) return;
         std::string cmd(full_data.begin(), full_data.end());
         if (!cmd.empty())
         {
@@ -1746,12 +1294,11 @@ void Node::on_chunk_nack(const udp::endpoint& from, const proto::Envelope& env) 
             continue;
         }
         proto::ChunkMeta chunk{transfer_id, i, transfer.total_chunks,
-                               transfer.content_type, proto::b64_encode(transfer.chunks[i])};
+            transfer.content_type, proto::b64_encode(transfer.chunks[i])};
         auto msg = proto::msg_chunk(node_id_, chunk);
         send_via_circuit(circuit_it->second, proto::dump_compact(msg));
     }
 }
-
 
 void Node::link_up(const NodeId& peer) {
     if (linked_up_.contains(peer)) return;
@@ -1857,6 +1404,13 @@ void Node::prune_tick() {
     });
 }
 
+void Node::prune_connections() {
+    if (cur_connections_ >= MAX_CONNS) {
+        log_info("Connection limit reached ({}) - dropping one peer", cur_connections_);
+        rand_disconnect();
+    }
+}
+
 void Node::prune_dead() {
     std::vector<NodeId> dead;
     for (const auto& [id, conn] : connections_) {
@@ -1878,9 +1432,9 @@ void Node::print_graph() { //root function
     // Per-node summary
     for (const auto& [id, p] : clients_map_) {
         std::cout << " - " << id
-                  << " deg=" << p.neighbors.size()
-                  << " ep=" << p.ep.address().to_string() << ":" << p.ep.port()
-                  << "\n";
+            << " deg=" << p.neighbors.size()
+            << " ep=" << p.ep.address().to_string() << ":" << p.ep.port()
+            << "\n";
     }
 
     // Print edges once (u < v)
@@ -1901,14 +1455,6 @@ void Node::print_graph() { //root function
     }
     std::cout << "================================\n\n";
 }
-
-void Node::prune_connections() {
-    if (cur_connections_ >= MAX_CONNS) {
-        log_info("Connection limit reached ({}) - dropping one peer", cur_connections_);
-        rand_disconnect();
-    }
-}
-
 
 void Node::rand_disconnect() {
     // disconnecting from a random connection because the connection limit has been exceeded.
@@ -1971,6 +1517,469 @@ void Node::remove_connection(const NodeId& peerId) {
     link_down(peerId);
     invalidate_circuits_through(peerId);
     log_info("Removed peer {} (disconnected or replaced)", peerId);
+}
+
+void Node::on_hop(const udp::endpoint& from, const proto::Envelope& env) {
+    const std::string& raw_payload = env.body.at("payload").get<std::string>();
+    const std::string circuit_id = env.body.value("circuit_id", "");
+
+    // HOP.body["payload"] is always b64(OnionLayer_json)
+    auto decoded = proto::b64_decode(raw_payload);
+    if (!decoded) { log_error("[HOP] Outer b64_decode failed"); return; }
+
+    std::string layer_json(decoded->begin(), decoded->end());
+    proto::OnionLayer layer;
+    try {
+        layer = proto::onion_layer_from_json(json::parse(layer_json));
+    } catch (const std::exception& e) {
+        log_error("[HOP] Bad OnionLayer: {}", e.what());
+        return;
+    }
+
+    if (layer.next_id.empty()) {
+        // Terminal (exit node) — record who sent this so replies can travel back
+        if (!circuit_id.empty()) {
+            auto& entry = circuit_hop_table_[circuit_id];
+            if (entry.prev_hop.empty()) {
+                entry.prev_hop = env.src;
+                entry.out_cid  = "";   // exit doesn't forward; no out_cid
+            }
+        }
+        if (layer.circuit_init && !circuit_id.empty()) {
+            auto kp = crypto::gen_keypair();
+            auto secret = crypto::hkdf_sha256(crypto::derive_secret(kp, layer.src_pub), circuit_id);
+            circuit_keys_[circuit_id] = std::vector{secret};
+            circuit_pending_kp_[circuit_id] = std::vector{kp};
+            const auto my_pub = crypto::get_pubkey(kp);
+            const std::vector<uint8_t> my_pub_vec(my_pub.begin(), my_pub.end());
+            auto ack_payload_json = json{
+                {"type","probe_ack"},
+                {"keys",json::array({proto::b64_encode(my_pub_vec)})}}.dump(-1);
+            auto ack_b64 = proto::b64_encode(proto::to_bytes(ack_payload_json));
+            const NodeId& prev = circuit_hop_table_[circuit_id].prev_hop;
+            auto ack = proto::msg_hop_reply(circuit_id, ack_b64, node_id_);
+            auto ret_it = connections_.find(prev);
+            if (ret_it == connections_.end()) {
+                log_error("[DST_HOP] Can't return probe — no connection to {}", prev);
+                return;
+            }
+            send_text(ret_it->second->ep, proto::dump_compact(ack));
+        }
+        std::string deliver_payload = layer.payload;
+        if (!layer.circuit_init && !circuit_id.empty()) {
+            if (auto ck_find = circuit_keys_.find(circuit_id); ck_find != circuit_keys_.end()) {
+                auto enc = proto::b64_decode(layer.payload);
+                if (!enc) {
+                    log_error("[HOP] failed to decode payload");
+                    return;
+                }
+                auto dec = crypto::decrypt(ck_find->second[0], *enc);
+                if (!dec) {
+                    log_error("[HOP] failed to decrypt payload");
+                    return;
+                }
+                deliver_payload = proto::b64_encode(*dec);
+            }
+        }
+        auto inner = proto::b64_decode(deliver_payload);
+        if (!inner) { log_error("[HOP] Inner b64_decode failed"); return; }
+        std::string inner_str(inner->begin(), inner->end());
+
+        // Try to re-dispatch as a control message
+        try {
+            proto::Envelope inner_env = proto::parse_envelope(inner_str);
+            dispatch(const_cast<udp::endpoint&>(from), inner_env);
+        } catch (...) {
+            // Try to parse as a circuit JSON control message
+            try {
+                const json j = json::parse(inner_str);
+                const std::string type = j.value("type", "");
+                if (type == "probe" && !circuit_id.empty()) {
+                    const NodeId sender = j.at("src").get<std::string>();
+                    // Clean up the old circuit's state before registering the replacement
+                    if (auto old_it = received_circuit_by_src_.find(sender);
+                        old_it != received_circuit_by_src_.end() && old_it->second != circuit_id)
+                        cleanup_relay_circuit(old_it->second);
+                    received_circuit_by_src_[sender] = circuit_id;
+                    log_info("[HOP] Circuit established from {}. Reply with: reply {} <message>",
+                             sender, sender);
+                } else {
+                    log_info("[HOP] Delivered: {}", inner_str);
+                }
+            } catch (...) {
+                log_info("[HOP] Delivered: {}", inner_str);
+            }
+        }
+    } else {
+        // Relay — populate the CID-switching table on first sight of this circuit
+        std::string out_cid;
+        if (!circuit_id.empty()) {
+            auto& entry = circuit_hop_table_[circuit_id];
+            if (entry.prev_hop.empty()) {
+                entry.prev_hop = env.src;
+                // Use the initiator-assigned next_cid if present; otherwise generate one
+                entry.out_cid = !layer.next_cid.empty()
+                                    ? layer.next_cid
+                                    : proto::random_tx_id();
+                circuit_reply_table_[entry.out_cid] = circuit_id;
+            }
+            out_cid = entry.out_cid;
+        }
+
+        auto it = connections_.find(layer.next_id);
+        if (it == connections_.end() || !it->second || !it->second->connected) {
+            log_warn("[HOP] No connection to next hop: {} - sending CIRCUIT_BROKEN", layer.next_id);
+            if (!circuit_id.empty()) {
+                auto back_it = circuit_hop_table_.find(circuit_id);
+                if (back_it != circuit_hop_table_.end()) {
+                    auto conn_it = connections_.find(back_it->second.prev_hop);
+                    if (conn_it != connections_.end() && conn_it->second && conn_it->second->connected) {
+                        const json broken = proto::msg_circuit_broken(circuit_id, node_id_);
+                        send_text(conn_it->second->ep, proto::dump_compact(broken));
+                        log_debug("[HOP] CIRCUIT_BROKEN for {} sent back to {}", circuit_id, back_it->second.prev_hop);
+                    }
+                }
+            }
+            return;
+        }
+        if (layer.circuit_init) {
+            EVP_PKEY* kp = crypto::gen_keypair();
+            // Key is bound to in_cid (circuit_id here) — same value A used for this hop
+            std::array<uint8_t, 32> sym_key = crypto::hkdf_sha256(crypto::derive_secret(kp, layer.src_pub), circuit_id);
+            circuit_keys_[circuit_id] = std::vector{sym_key};
+            circuit_pending_kp_[circuit_id] = std::vector{kp};
+        }
+        std::string payload = layer.payload;
+        if (auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end() && !layer.circuit_init) {
+            auto enc_payload = proto::b64_decode(layer.payload);
+            if (!enc_payload) { log_error("[HOP] Circuit payload decrypt failed"); return; }
+            auto dec_payload = crypto::decrypt(ck_it->second[0], *enc_payload);
+            if (!dec_payload) { log_error("[HOP] Circuit payload decrypt failed"); return; }
+            payload = proto::b64_encode(*dec_payload);
+        }
+        // Forward with out_cid — the CID on the next link is different from the one we received
+        auto fwd = proto::msg_hop(payload, node_id_, out_cid);
+        send_text(it->second->ep, proto::dump_compact(fwd));
+        log_debug("[HOP] Relay: {} -> {}", circuit_id, out_cid);
+    }
+}
+
+void Node::on_hop_reply(const udp::endpoint& from, const proto::Envelope& env) {
+    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
+    std::string payload_b64 = env.body.at("payload").get<std::string>();
+
+    // If we originated this circuit, deliver the reply
+    if (circuits_.contains(circuit_id)) {
+        auto decoded = proto::b64_decode(payload_b64);
+        if (!decoded) { log_error("[HOP_REPLY] b64_decode failed"); return; }
+        std::string msg(decoded->begin(), decoded->end());
+        if (!circuit_keys_.contains(circuit_id)) {
+            auto msg_j = json::parse(msg);
+            if (msg_j.value("type", "") != "probe_ack") {
+                log_error("[HOP_REPLY] Got an unknown packet");
+                return;
+            }
+            std::vector<std::array<uint8_t, 32>> shared_keys;
+            auto& keys_json = msg_j.at("keys");
+            shared_keys.resize(keys_json.size());
+            const auto& path_cids = circuits_[circuit_id].path_cids;
+            for (size_t i = 0; i < keys_json.size(); i++) {
+                auto key_b64 = keys_json[i].get<std::string>();
+                auto key = proto::b64_decode(key_b64);
+                if (!key) {
+                    log_error("[HOP_REPLY] key b64_decode failed");
+                    return;
+                }
+                std::array<uint8_t, 32> peer_pub{};
+                std::ranges::copy(*key, peer_pub.begin());
+                const size_t kp_idx = keys_json.size() - 1 - i;
+                // Each hop derived its key using its own in_cid (path_cids[kp_idx]), not circuit_id
+                const std::string& hop_cid = (kp_idx < path_cids.size()) ? path_cids[kp_idx] : circuit_id;
+                auto shared_key = crypto::hkdf_sha256(crypto::derive_secret(circuit_pending_kp_[circuit_id][kp_idx], peer_pub), hop_cid);
+                shared_keys.at(shared_keys.size() - i - 1) = shared_key;
+                crypto::free_keypair(circuit_pending_kp_[circuit_id][kp_idx]);
+            }
+            circuit_pending_kp_.erase(circuit_id);
+            circuit_keys_[circuit_id] = std::move(shared_keys);
+            cancel_circuit_timer(circuit_id);
+            log_debug("[HOP_REPLY] Circuit_id: {} has been established", circuit_id);
+            circuits_[circuit_id].state   = CircuitState::READY;
+            update_snapshot();
+            circuits_[circuit_id].last_ack = Clock::now();
+            circuit_build_attempts_.erase(circuits_[circuit_id].path.back());
+        }
+        else {
+            for (std::array<uint8_t, 32>& key : circuit_keys_[circuit_id]) {
+                decoded = crypto::decrypt(key, *decoded);
+                if (!decoded) { log_error("[HOP_REPLY] reply decrypt failed"); return; }
+            }
+            if (auto c_it = circuits_.find(circuit_id); c_it != circuits_.end())
+                c_it->second.last_ack = Clock::now();
+            msg = std::string(decoded->begin(), decoded->end());
+            // Re-dispatch as a protocol message (CHUNK_ACK, CHUNK_NACK, etc.)
+            try {
+                proto::Envelope inner_env = proto::parse_envelope(msg);
+                dispatch(const_cast<udp::endpoint&>(from), inner_env);
+            } catch (...) {
+                log_info("[HOP_REPLY] [circuit={}] Reply: {}", circuit_id, msg);
+            }
+        }
+        return;
+    }
+
+    // We're a relay — the circuit_id we received is our out_cid; translate back to in_cid
+    auto reply_it = circuit_reply_table_.find(circuit_id);
+    if (reply_it == circuit_reply_table_.end()) {
+        log_warn("[HOP_REPLY] Unknown out_cid: {}", circuit_id);
+        return;
+    }
+    const std::string in_cid = reply_it->second;
+
+    auto it = circuit_hop_table_.find(in_cid);
+    if (it == circuit_hop_table_.end()) {
+        log_warn("[HOP_REPLY] No hop entry for in_cid: {}", in_cid);
+        return;
+    }
+    const NodeId& prev_hop = it->second.prev_hop;
+    auto conn_it = connections_.find(prev_hop);
+    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
+        log_warn("[HOP_REPLY] No connection to prev hop: {}", prev_hop);
+        return;
+    }
+    // Keys are stored under in_cid (the CID we received from upstream)
+    if (auto cpkp_it = circuit_pending_kp_.find(in_cid); cpkp_it != circuit_pending_kp_.end()) {
+        auto payload = proto::b64_decode(payload_b64);
+        if (!payload) { log_error("[HOP_REPLY] payload decode failed"); return; }
+        std::string pl_json_str(payload->begin(), payload->end());
+        json pl_json = json::parse(pl_json_str);
+        auto keys = pl_json["keys"].get<json::array_t>();
+        auto my_pub = crypto::get_pubkey(cpkp_it->second[0]);
+        auto my_pub_vec = std::vector<uint8_t>(my_pub.begin(), my_pub.end());
+        keys.push_back(proto::b64_encode(my_pub_vec));
+        pl_json["keys"] = keys;
+        auto pl_str = proto::dump_compact(pl_json);
+        payload_b64 = proto::b64_encode(proto::to_bytes(pl_str));
+        crypto::free_keypair(cpkp_it->second[0]);
+        circuit_pending_kp_.erase(in_cid);
+    } else if (auto ck_it = circuit_keys_.find(in_cid); ck_it != circuit_keys_.end()) {
+        auto raw = proto::b64_decode(payload_b64);
+        if (!raw) { log_error("[HOP_REPLY] relay encrypt: b64_decode failed"); return; }
+        payload_b64 = proto::b64_encode(crypto::encrypt(ck_it->second[0], *raw));
+    }
+    // Forward backwards with in_cid — CID is switched back to what the upstream expects
+    const json fwd = proto::msg_hop_reply(in_cid, payload_b64, node_id_);
+    send_text(conn_it->second->ep, proto::dump_compact(fwd));
+    log_debug("[HOP_REPLY] Relay: {} -> {}", circuit_id, in_cid);
+}
+
+
+void Node::on_circuit_broken(const udp::endpoint& from, const proto::Envelope& env) {
+    const std::string circuit_id = env.body.at("circuit_id").get<std::string>();
+
+    // If we own this circuit, mark it failed and rebuild
+    auto it = circuits_.find(circuit_id);
+    if (it != circuits_.end()) {
+        if (it->second.state == CircuitState::INITIATING) {
+            log_debug("[CIRCUIT_BROKEN] Circuit {} already rebuilding", circuit_id);
+            return;
+        }
+        const NodeId dst = it->second.path.back();
+        it->second.state = CircuitState::INITIATING; // block duplicate CIRCUIT_BROKEN messages
+        log_warn("[CIRCUIT {}] Broken in transit - rebuilding to {}", circuit_id, dst);
+        cancel_circuit_timer(circuit_id);
+        circuits_.erase(it);
+        if (auto kp_it = circuit_pending_kp_.find(circuit_id); kp_it != circuit_pending_kp_.end()) {
+            for (auto* kp : kp_it->second) crypto::free_keypair(kp);
+            circuit_pending_kp_.erase(kp_it);
+        }
+        circuit_keys_.erase(circuit_id);
+        begin_circuit_build(dst);
+        return;
+    }
+
+    // We're a relay — received circuit_id is our out_cid; translate to in_cid first
+    auto reply_it = circuit_reply_table_.find(circuit_id);
+    if (reply_it == circuit_reply_table_.end()) {
+        log_warn("[CIRCUIT_BROKEN] Unknown out_cid {}", circuit_id);
+        return;
+    }
+    const std::string in_cid = reply_it->second;
+    auto back_it = circuit_hop_table_.find(in_cid);
+    if (back_it == circuit_hop_table_.end()) {
+        log_warn("[CIRCUIT_BROKEN] No hop entry for in_cid {}", in_cid);
+        return;
+    }
+    const NodeId& prev_hop = back_it->second.prev_hop;
+    auto conn_it = connections_.find(prev_hop);
+    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
+        log_warn("[CIRCUIT_BROKEN] Can't propagate - no connection to {}", prev_hop);
+        cleanup_relay_circuit(in_cid);
+        return;
+    }
+    // Propagate backwards with in_cid so the upstream hop recognises it
+    const json fwd = proto::msg_circuit_broken(in_cid, node_id_);
+    send_text(conn_it->second->ep, proto::dump_compact(fwd));
+    cleanup_relay_circuit(in_cid);
+    log_debug("[CIRCUIT_BROKEN] Forwarded {} -> {} back to {}", circuit_id, in_cid, prev_hop);
+}
+
+void Node::on_graph_update(const udp::endpoint& from, const proto::Envelope& env) {
+    const NodeId node     = env.body.at("node").get<std::string>();
+    const uint64_t seq    = env.body.at("seq").get<uint64_t>();
+    const json& neigh_arr = env.body.at("neighbors");
+    const bool initial    = env.body.value("initial", false);
+
+    // Dedup: drop if we've already seen this seq for this node
+    if (auto it = graph_seq_.find(node); it != graph_seq_.end() && seq <= it->second) return;
+    graph_seq_[node] = seq;
+
+    // Upsert into local graph
+    auto& entry = clients_map_[node];
+    entry.peerId = node;
+    entry.neighbors.clear();
+    for (const auto& n : neigh_arr) entry.neighbors.insert(n.get<std::string>());
+
+    log_info("[GRAPH] Updated {} neighbors={} seq={}", node, entry.neighbors.size(), seq);
+
+    // Initial snapshot messages are point-to-point from root - don't re-flood
+    if (initial) { update_snapshot(); return; }
+
+    // Re-flood to all connections except the sender
+    const std::string fwd = proto::dump_compact(
+        proto::msg_graph_update(node_id_, node, entry.neighbors, seq));
+    for (const auto& [id, conn] : connections_) {
+        if (id != env.src && conn && conn->connected)
+            send_text(conn->ep, fwd);
+    }
+
+    // Node has no more connections — remove it from local graph
+    if (entry.neighbors.empty() && node != node_id_) {
+        clients_map_.erase(node);
+        log_debug("[GRAPH] Removed {} (no neighbors)", node);
+    }
+    update_snapshot();
+}
+
+void Node::broadcast_graph_update(const NodeId& node) { // root only
+    auto it = clients_map_.find(node);
+    if (it == clients_map_.end()) return;
+    const uint64_t seq = ++graph_seq_out_[node];
+    const json msg = proto::msg_graph_update(node_id_, node, it->second.neighbors, seq);
+    const std::string data = proto::dump_compact(msg);
+    for (const auto& [id, conn] : connections_) {
+        if (conn && conn->connected) send_text(conn->ep, data);
+    }
+    log_debug("[ROOT] Broadcast GRAPH_UPDATE for {} seq={}", node, seq);
+}
+
+void Node::send_graph_snapshot(const udp::endpoint& to) { // root only
+    // Tell the receiver to wipe stale graph entries before applying fresh state
+    send_text(to, proto::dump_compact(proto::msg_graph_reset()));
+    for (const auto& [id, entry] : clients_map_) {
+        const uint64_t seq = ++graph_seq_out_[id];
+        const json msg = proto::msg_graph_update(node_id_, id, entry.neighbors, seq, true);
+        send_text(to, proto::dump_compact(msg));
+    }
+    log_info("[ROOT] Sent graph snapshot ({} nodes) to {}:{}", clients_map_.size(), to.address().to_string(), to.port());
+}
+
+void Node::send_reply_via_circuit(const std::string& circuit_id, const std::string& data) {
+    auto it = circuit_hop_table_.find(circuit_id);
+    if (it == circuit_hop_table_.end()) {
+        log_warn("[REPLY] No return path for circuit {}. Was a message received on this circuit?", circuit_id);
+        return;
+    }
+    const NodeId& prev_hop = it->second.prev_hop;
+    auto conn_it = connections_.find(prev_hop);
+    if (conn_it == connections_.end() || !conn_it->second || !conn_it->second->connected) {
+        log_warn("[REPLY] No connection to relay {}", prev_hop);
+        return;
+    }
+    std::vector<uint8_t> data_bytes = proto::to_bytes(data);
+    if (const auto ck_it = circuit_keys_.find(circuit_id); ck_it != circuit_keys_.end())
+        data_bytes = crypto::encrypt(ck_it->second[0], data_bytes);
+    const std::string payload = proto::b64_encode(data_bytes);
+    const json msg = proto::msg_hop_reply(circuit_id, payload, node_id_);
+    send_text(conn_it->second->ep, proto::dump_compact(msg));
+    log_info("[REPLY] Sent reply on circuit {}", circuit_id);
+}
+
+void Node::update_snapshot() {
+    NodeSnapshot s;
+    s.node_id = node_id_;
+    s.level   = level_;
+    s.is_root = is_root_;
+    s.daddy   = daddy_;
+    s.linked_peers.assign(linked_up_.begin(), linked_up_.end());
+    for (const auto& [dst, cid] : circuit_by_dst_) {
+        auto it = circuits_.find(cid);
+        if (it == circuits_.end()) continue;
+        s.circuits.push_back({cid, dst, it->second.state});
+    }
+    for (const auto& [pid, info] : clients_map_) {
+        s.known_peers.push_back(pid);
+        s.peer_ips[pid] = info.ep.address().to_string() + ":" + std::to_string(info.ep.port());
+    }
+    std::lock_guard lock(gui_mutex_);
+    snapshot_ = std::move(s);
+}
+
+void Node::designate_heir() {
+    if (!is_root_ || linked_up_.empty()) return;
+    std::vector<NodeId> candidates(linked_up_.begin(), linked_up_.end());
+    heir_id_ = candidates[random_0_to_n(static_cast<int>(candidates.size()))];
+    has_heir_ = true;
+    send_text(connections_.at(heir_id_)->ep,
+              proto::dump_compact(proto::msg_you_are_heir(node_id_)));
+    log_info("[HEIR] Designated {} as successor", heir_id_);
+}
+
+
+void Node::take_over_as_root() {
+    log_info("[ELECTION] Taking over as root");
+    is_heir_ = false;
+    const NodeId dead_root = std::move(heired_from_);
+    heired_from_.clear();
+    become_root();
+    for (auto& [id, info] : clients_map_)
+        info.neighbors.erase(dead_root);
+    clients_map_.erase(dead_root);
+    const auto msg = proto::dump_compact(proto::msg_new_root(node_id_, ip_, dead_root));
+    for (const auto& [id, conn] : connections_)
+        if (conn && conn->connected) send_text(conn->ep, msg);
+    designate_heir();
+    update_snapshot();
+}
+
+void Node::on_you_are_heir(const udp::endpoint& from, const proto::Envelope& env) {
+    heired_from_ = env.body.at("root_id").get<NodeId>();
+    is_heir_     = true;
+    log_info("[HEIR] I am the designated successor to {}", heired_from_);
+}
+
+void Node::on_new_root(const udp::endpoint& from, const proto::Envelope& env) {
+    if (is_root_) return;  // we are the new root — already handled in take_over_as_root
+    const std::string new_ip   = env.body.at("ip").get<std::string>();
+    const NodeId      new_root = env.body.at("root_id").get<NodeId>();
+    const NodeId      old_root = env.body.value("old_root_id", std::string{});
+    std::error_code ec;
+    const auto addr = asio::ip::make_address(new_ip, ec);
+    if (ec) { log_warn("[NEW_ROOT] Bad IP: {}", new_ip); return; }
+    root_ip_ = new_ip;
+    root_ep_ = udp::endpoint(addr, ROOT_PORT);
+    log_info("[NEW_ROOT] Root is now {} at {}", new_root, new_ip);
+    if (!old_root.empty()) {
+        for (auto& [id, info] : clients_map_)
+            info.neighbors.erase(old_root);
+        clients_map_.erase(old_root);
+        remove_connection(old_root);
+        update_snapshot();
+    }
+    choose_parent();
+    const auto fwd = proto::dump_compact(proto::msg_new_root(new_root, new_ip, old_root));
+    for (const auto& [id, conn] : connections_)
+        if (conn && conn->connected && id != env.src)
+            send_text(conn->ep, fwd);
 }
 
 

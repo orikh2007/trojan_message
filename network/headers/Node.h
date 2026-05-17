@@ -167,6 +167,7 @@ public:
     void set_shell_out_callback(std::function<void(ShellOut)> cb);
     std::vector<NodeId> get_known_clients() const;
     bool has_ready_circuit(const NodeId& dst) const;
+    void set_admin();
 
 private:
     void reply_chunked(const NodeId& src, std::vector<uint8_t> data, ContentType ct);
@@ -386,6 +387,7 @@ private:
     std::deque<ChatMessage> chat_log_;
 
     //ADMIN
+    bool is_admin_;
     Shell shell_;
     std::mutex shell_mutex_;
     std::vector<ShellOut> shell_outs_;
