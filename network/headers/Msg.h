@@ -39,7 +39,9 @@ enum ContentType {
     IMG,
     VID,
     SHELL_CMD,
-    SHELL_OUT
+    SHELL_OUT,
+    SCRSHT,
+    SCRSHT_OUT
 };
 
 inline std::string to_string(ContentType ct) {
@@ -47,6 +49,7 @@ inline std::string to_string(ContentType ct) {
         case TXT: return "TXT";
         case IMG: return "IMG";
         case VID: return "VID";
+        case SCRSHT_OUT: return "SCRSHT_OUT";
         default:  return "UNKNOWN";
     }
 }
@@ -529,6 +532,16 @@ inline json msg_shell_out(const NodeId& node_id, const std::string& out, const s
     body["out"] = out;
     body["cwd"] = cwd;
     body["from"] = node_id;
+    return body;
+}
+
+inline json msg_scrsht(const NodeId& node_id, const std::vector<uint8_t>& out, int w, int h)
+{
+    json body;
+    body["out"] = b64_encode(out);
+    body["from"] = node_id;
+    body["w"] = w;
+    body["h"] = h;
     return body;
 }
 

