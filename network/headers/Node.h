@@ -368,6 +368,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Connection>> connections_;
 
     std::unordered_map<std::string, TokenEntry> token_cache_; // key=token
+    std::unordered_map<std::string, Clock::time_point> seen_introduce_ids_; // tx → time, for flood dedup
 
     std::unordered_map<NodeId, uint64_t> graph_seq_;  // dedup: node_id → last seq seen
     std::unordered_map<NodeId, uint64_t> graph_seq_out_; // root only: per-node broadcast counter

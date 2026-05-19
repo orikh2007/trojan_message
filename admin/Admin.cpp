@@ -7,7 +7,7 @@
 Admin::Admin(int port) {
     image_path_ = "C://scrshts";
     node_ = std::make_shared<Node>(static_cast<uint16_t>(port));
-    Logger::get().set_level(LogLevel::DEBUG);
+    Logger::get().set_level(LogLevel::ERR);
 
     node_->set_shell_out_callback([this](ShellOut out) {
         {

@@ -563,11 +563,15 @@ void Node::on_req_conns(const udp::endpoint& from, const proto::Envelope& env) {
     log_info("Sent REQ_CONNS_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
 
     for (auto membr : peers){
-        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
-        auto epMembr = membr.ep;
+        const json jMembr = proto::msg_introduce(curP, membr.tkn, membr.peerId);
         const auto dataMembr = proto::dump_compact(jMembr);
-        send_text(epMembr, dataMembr);
-        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
+        if (membr.peerId == node_id_) {
+            remember_token(curP.peerId, membr.tkn, 6000);
+            start_punch(curP, 4000, 250, membr.tkn);
+        } else {
+            broadcast(dataMembr);
+            log_debug("Broadcast INTRODUCE for target {}", membr.peerId);
+        }
     }
 }
 
@@ -672,14 +676,32 @@ void Node::prune_tokens() {
         if (it->second.expires <= now) it = token_cache_.erase(it);
         else ++it;
     }
+    for (auto it = seen_introduce_ids_.begin(); it != seen_introduce_ids_.end(); ) {
+        if (now - it->second > std::chrono::seconds(60)) it = seen_introduce_ids_.erase(it);
+        else ++it;
+    }
 }
 
 void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     if (env.src != "ROOT")
         log_warn("INTRODUCE from unexpected source: {} (body: {})", env.src, env.body.dump());
 
-    const json& body = env.body;
+    // Dedup: ignore if we've already forwarded/processed this flood message
+    if (seen_introduce_ids_.count(env.tx)) return;
+    seen_introduce_ids_[env.tx] = Clock::now();
 
+    const json& body = env.body;
+    const std::string target_id = body.value("target_id", "");
+
+    if (!target_id.empty() && target_id != node_id_) {
+        // Not for us — forward to all connected peers except the one we received it from
+        const std::string data = proto::dump_compact(proto::make_envelope(env.type, env.src, env.tx, body));
+        for (auto& [id, conn] : connections_) {
+            if (conn && conn->connected && conn->ep != from)
+                send_text(conn->ep, data);
+        }
+        return;
+    }
 
     const std::string peer_id = body.at("peer").at("id").get<std::string>();
     const std::string pIp     = body.at("peer").at("ip").get<std::string>();
@@ -688,7 +710,6 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     const int timeout  = body.value("timeout_ms", 4000);
     const int punch_ms = body.value("punch_ms", 250);
     const std::string tkn = body.at("token").get<std::string>();
-
 
     std::error_code ec;
     auto pAddr = asio::ip::make_address(pIp, ec);
@@ -944,11 +965,16 @@ void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, cons
     log_info("Sent REGISTER_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
 
     for (const auto& membr : peers){
-        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
-        auto epMembr = membr.ep;
+        const json jMembr = proto::msg_introduce(curP, membr.tkn, membr.peerId);
         const auto dataMembr = proto::dump_compact(jMembr);
-        send_text(epMembr, dataMembr);
-        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
+        if (membr.peerId == node_id_) {
+            // Root is the target — self-process directly without waiting for flood
+            remember_token(curP.peerId, membr.tkn);
+            start_punch(curP, 4000, 250, membr.tkn);
+        } else {
+            broadcast(dataMembr);
+            log_debug("Broadcast INTRODUCE for target {}", membr.peerId);
+        }
     }
 
 } /* for root - handles register_ack -
@@ -2151,12 +2177,10 @@ void Node::on_introduce_req(const udp::endpoint& from, const proto::Envelope& en
     // Tell requester about target (requester will punch target)
     req_peer.tkn = token;
     tgt_peer.tkn = token;
-    const json intro_to_req = proto::msg_introduce(tgt_peer, token);
-    send_text(req_peer.ep, proto::dump_compact(intro_to_req));
+    broadcast(proto::dump_compact(proto::msg_introduce(tgt_peer, token, req_peer.peerId)));
 
     // Tell target about requester (target will punch requester) - simultaneous open
-    const json intro_to_tgt = proto::msg_introduce(req_peer, token);
-    send_text(tgt_peer.ep, proto::dump_compact(intro_to_tgt));
+    broadcast(proto::dump_compact(proto::msg_introduce(req_peer, token, tgt_peer.peerId)));
 
     log_info("[ROOT] Introduced {} <-> {}", requester_id, target_id);
 }

@@ -496,6 +496,7 @@ inline json msg_linkdown(const NodeId& peer, const NodeId& src) {
 
 inline json msg_introduce(const PeerInfo& peer,
                           const std::string& token_hex,
+                          const std::string& target_id,
                           int ka_ms = 15000, int punch_ms = 250, int timeout_ms = 4000) {
     require(peer.peerId.size() == 16 && is_hex(peer.peerId), "peer.id must be 16 hex chars");
     require(token_hex.size() == 16 && is_hex(token_hex), "token must be 16 hex chars");
@@ -506,6 +507,7 @@ inline json msg_introduce(const PeerInfo& peer,
     body["token"] = token_hex;
     body["punch_ms"] = punch_ms;
     body["timeout_ms"] = timeout_ms;
+    body["target_id"] = target_id;
 
     return make_envelope(MsgType::INTRODUCE, "ROOT", random_tx_id(), body);
 }
