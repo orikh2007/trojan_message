@@ -1,9 +1,13 @@
 cmake_minimum_required(VERSION 4.0)
+
+set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "" FORCE)
+
 project(trojan_message)
 
 set(CMAKE_CXX_STANDARD 20)
 
 if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_options(/W4 /permissive- /EHsc)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
@@ -43,6 +47,9 @@ add_executable(admin
 )
 
 
+set(OPENSSL_USE_STATIC_LIBS ON)
+set(CURL_USE_STATIC_LIBS ON)
+
 find_package(CURL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -51,7 +58,7 @@ find_package(imgui CONFIG REQUIRED)
 target_compile_definitions(trojan_message PRIVATE ASIO_STANDALONE)
 
 if (WIN32)
-    target_link_libraries(trojan_message PRIVATE ws2_32 mswsock)
+    target_link_libraries(trojan_message PRIVATE ws2_32 mswsock crypt32 bcrypt)
 endif()
 
 target_link_libraries(trojan_message
@@ -69,7 +76,7 @@ target_link_libraries(trojan_message
 target_compile_definitions(admin PRIVATE ASIO_STANDALONE _WIN32_WINNT=0x0601)
 
 if (WIN32)
-    target_link_libraries(admin PRIVATE ws2_32 mswsock)
+    target_link_libraries(admin PRIVATE ws2_32 mswsock crypt32 bcrypt)
 endif()
 
 target_link_libraries(admin

@@ -8,12 +8,12 @@
 
 int main(int argc, char* argv[]) {
     // Single-instance guard: if already running, show the hidden window and exit
-    //HANDLE inst_mutex = CreateMutexW(nullptr, TRUE, L"TrojanMessageMutex");
-    // if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    //    HWND existing = FindWindowW(L"TrojanGUI", nullptr);
-    //    if (existing) PostMessageW(existing, WM_APP + 2, 0, 0);
-    //    return 0;
-    //}
+    HANDLE inst_mutex = CreateMutexW(nullptr, TRUE, L"TrojanMessageMutex");
+     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"TrojanGUI", nullptr);
+        if (existing) PostMessageW(existing, WM_APP + 2, 0, 0);
+        return 0;
+    }
 
     try {
         std::cout << getIP(v4) << "\n";
@@ -47,7 +47,4 @@ int main(int argc, char* argv[]) {
         std::cerr << "exception: " << e.what() << "\n";
         return 1;
     }
-    // crypto_test t{};
-    // t.run_crypto_tests_sym();
-    // t.run_crypto_tests_asym();
 }
