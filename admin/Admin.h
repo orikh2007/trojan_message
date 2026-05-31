@@ -3,6 +3,10 @@
 #include "../network/headers/networkSettings.h"
 #include <thread>
 #include <condition_variable>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
 
 class Admin {
 public:
@@ -20,6 +24,13 @@ private:
     std::string active_session_cwd_;
 
     std::mutex cv_mtx_;
+    std::mutex cv_mtx_scrsht_;
     std::condition_variable cv_;
+    std::condition_variable cv_scrsht_;
     std::vector<ShellOut> pending_outs_;
+    std::vector<std::vector<uint8_t>> pending_scrsht_outs_;
+
+    fs::path image_path_;
+    uint32_t scrsht_count_ = 0;
+
 };
