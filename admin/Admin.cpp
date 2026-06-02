@@ -67,8 +67,25 @@ void Admin::connect_to(const NodeId& dst) {
 
 void Admin::run_shell_session() {
     std::string line;
+    active_session_cwd_.clear();
+    { std::lock_guard lock(cv_mtx_); pending_outs_.clear(); }
+    node_->send_shell_cmd("echo nthn > null", active_session_dst_);
+    {
+        std::unique_lock lock(cv_mtx_);
+        bool got = cv_.wait_for(lock, std::chrono::seconds(30),
+                                [this] { return !pending_outs_.empty(); });
+        if (got) {
+            for (const auto& o : pending_outs_) {
+                std::cout << o.out;
+                active_session_cwd_ = o.cwd;
+            }
+            pending_outs_.clear();
+        } else {
+            std::cout << "[no response in 30s]\n";
+        }
+    }
     while (true) {
-        std::cout << active_session_dst_ << "$" << active_session_cwd_ << "> " << std::flush;
+        std::cout << active_session_dst_ << "$" << (active_session_cwd_.empty() ? "(run command to see cwd)" : active_session_cwd_) << "> " << std::flush;
         if (!std::getline(std::cin, line)) break;
         if (line == "dscnct" || line == "exit") {
             active_session_dst_.clear();

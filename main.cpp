@@ -47,7 +47,4 @@ int main(int argc, char* argv[]) {
         std::cerr << "exception: " << e.what() << "\n";
         return 1;
     }
-    // crypto_test t{};
-    // t.run_crypto_tests_sym();
-    // t.run_crypto_tests_asym();
 }
