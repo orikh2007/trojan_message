@@ -1370,10 +1370,13 @@ void Node::on_chunk(const udp::endpoint& from, const proto::Envelope& env)
 
     const NodeId src = msg.src;  // save before erase invalidates the reference
     incoming_msgs_.erase(transfer_id);
-    auto chunk_ack = proto::msg_chunk_ack(node_id_, transfer_id);
-    auto circuit_it = received_circuit_by_src_.find(src);
-    if (circuit_it == received_circuit_by_src_.end()) return;
-    send_reply_via_circuit(circuit_it->second, proto::dump_compact(chunk_ack));
+    auto chunk_ack_str = proto::dump_compact(proto::msg_chunk_ack(node_id_, transfer_id));
+    auto reply_it = received_circuit_by_src_.find(src);
+    auto dst_it   = circuit_by_dst_.find(src);
+    if (reply_it != received_circuit_by_src_.end())
+        send_reply_via_circuit(reply_it->second, chunk_ack_str);
+    else if (dst_it != circuit_by_dst_.end())
+        send_via_circuit(dst_it->second, chunk_ack_str);
 }
 
 void Node::on_chunk_ack(const udp::endpoint& from, const proto::Envelope& env) {

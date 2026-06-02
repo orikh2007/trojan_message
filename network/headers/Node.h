@@ -29,7 +29,7 @@ constexpr int ROOT_PORT = 12345;
 constexpr int MIN_RELAYS = 1;
 constexpr int MAX_RELAYS = 4;
 constexpr int MIN_GRAPH_SIZE = 2; // minimum nodes in local graph to attempt circuit building
-constexpr size_t CHUNK_SIZE = 1600;
+constexpr size_t CHUNK_SIZE = 400;
 constexpr auto   chunk_send_interval_ms = std::chrono::milliseconds(1);
 
 using udp = asio::ip::udp;
